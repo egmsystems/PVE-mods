@@ -15,12 +15,13 @@ my $last_snapshot = {};
 my $last_mtime = 0;
 my $is_collector_parent = 0;  # Flag to track if this process started collectors
 my $last_get_stats_time = 0;  # Track when get_stats was last called
-my $COLLECTOR_TIMEOUT = 30;   # Stop collectors 30 seconds after last get_stats call
+my $COLLECTOR_TIMEOUT = 0;   # Stop collectors x seconds after last get_stats call
 
 my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
 my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
 my $nvidia_gpu_enabled = 0; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
-
+my $monitor_pid;
+my $monitor_running = 0;
 
 # ============================================================================
 # Intel GPU Support
@@ -131,7 +132,8 @@ sub get_intel_gpu_devices {
 
 sub collector_for_intel_device {
     my ($device) = @_;
-    
+    $0 = "pve-mod-gpu-intel-collector: $device->{card}";
+
     my $drm_dev = "drm:/dev/dri/$device->{card}";
     my $intel_gpu_top_pid = undef;
     
@@ -472,6 +474,10 @@ sub start_collector {
         warn "DEBUG start_collector: ERROR - No children alive after fork!";
     }
     
+    # Start pve_mod_monitor process
+    pve_mod_monitor();
+
+
     # Remove startup lock LAST
     unlink($startup_lock);
     warn "DEBUG start_collector: Released startup lock";
@@ -563,10 +569,43 @@ sub get_stats {
     # Update cache
     $last_snapshot = $merged;
     $last_mtime = $newest_mtime;
+    $last_get_stats_time = time();
     
     warn "DEBUG: Successfully merged " . scalar(keys %{$merged->{Graphics}->{Intel}}) . " device node(s)";
     
     return $last_snapshot;
+}
+
+sub pve_mod_monitor {
+    return if $monitor_running;
+    
+    $monitor_pid = fork();
+
+    if (!defined $monitor_pid) {
+        warn "ERROR: Failed to fork monitor process: $!";
+        return;
+    }
+    
+    if ($monitor_pid == 0) {
+        # Child process
+        $0 = "pve_mod_monitor"; # Set process name for easier identification
+        
+        while (1) {
+            if(time() - $last_get_stats_time > $COLLECTOR_TIMEOUT) {
+                warn "DEBUG pve_mod_monitor: No get_stats call in the last $COLLECTOR_TIMEOUT seconds, stopping collectors";
+                stop_collectors();
+                exit(0);
+            }
+            sleep(1);
+            warn "DEBUG pve_mod_monitor: pve_mod_monitor still running";
+        }
+        
+        exit(0); # This shouldn't be reached, but just in case
+    }
+    
+    # Parent process
+    $monitor_running = 1;
+    warn "DEBUG start_monitor: Monitor process started with PID $monitor_pid";
 }
 
 sub cleanup {
