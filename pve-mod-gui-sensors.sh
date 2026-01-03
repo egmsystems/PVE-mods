@@ -146,7 +146,7 @@ function configure {
 	#endregion sensors collection
 
 	#### CPU ####
-	#region cpu setup
+	#region CPU setup
 	msgb "\n=== Detecting CPU temperature sensors ==="
 	ENABLE_CPU=false
 	local cpuList=""
@@ -195,6 +195,58 @@ function configure {
 		warn "No CPU temperature sensors found."
 	fi
 	#endregion cpu setup
+	
+	#### Graphics ####
+	#region Graphics setup
+	msgb "\n=== Detecting Graphics information ==="
+
+	#region intel GPU setup
+	# Check for Intel GPU - ensure intel_gpu_top is installed
+	if command -v intel_gpu_top &>/dev/null; then
+		# detect all intel cards using intel_gpu_top -L. Show them line by line
+		local intelCards
+		
+		# Get the output from intel_gpu_top -L, skip empty lines
+		intelCards=$(intel_gpu_top -L 2>/dev/null | grep -E '^card[0-9]+' || true)
+		
+		if [[ -n "$intelCards" ]]; then
+			local cardCount=$(echo "$intelCards" | wc -l)
+			echo "Intel GPU(s) detected ($cardCount):"
+			echo "$intelCards" | while IFS= read -r line; do
+				# Extract card name, GPU model, and PCI info
+				if [[ $line =~ ^(card[0-9]+)[[:space:]]+(.+)[[:space:]]+pci:(.+)$ ]]; then
+					local cardName="${BASH_REMATCH[1]}"
+					local gpuModel="${BASH_REMATCH[2]}"
+					local pciInfo="${BASH_REMATCH[3]}"
+					
+					echo "  - Card: $cardName"
+					echo "    Model: $gpuModel"
+					echo "    PCI: $pciInfo"
+				else
+					# Fallback: just show the line as-is
+					echo "  $line"
+				fi
+			done
+			ENABLE_INTEL_GPU_INFO=true
+		else
+			warn "No Intel GPUs detected by intel_gpu_top."
+			ENABLE_INTEL_GPU_INFO=false
+		fi
+	else
+		warn "intel_gpu_top command not found. Skipping Intel GPU information detection."
+		ENABLE_INTEL_GPU_INFO=false
+	fi
+	#endregion intel GPU setup
+
+	#region NVIDIA GPU setup
+	# not implemented yet
+	#endregion NVIDIA GPU setup
+
+	#region AMD GPU setup
+	# not implemented yet
+	#endregion AMD GPU setup
+
+	#endregion Graphics setup
 
 	#### RAM ####
 	#region ram setup
@@ -549,6 +601,26 @@ collect_ups_output() {
     info "UPS retriever added to \"$output_file\"."
 }
 
+collect_graphics_intel_output() {
+	local output_file="$1"
+	local intelCmd
+
+
+use threads;
+use JSON;
+
+my $snapshot;
+
+threads->create(sub {
+    while (1) {
+        my $json = `intel_gpu_top -J -s 1`;
+        $snapshot = decode_json($json);
+        sleep 1; # optional
+    }
+});
+
+
+}
 
 # Collect system information
 collect_system_info() {
