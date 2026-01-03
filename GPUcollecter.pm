@@ -39,7 +39,7 @@ sub _debug {
 my $stats_dir = '/var/run/pve-gpu';
 my $state_file = '/var/run/pve-gpu/stats.json';
 my $lock_file = '/var/run/pve-gpu/pve-gpu-collector.lock';
-my $monitor_lock = '/var/run/pve-gpu/pve-gpu-monitor.lock';
+my $monitor_lock = '/var/run/pve-gpu/pve-mod-monitor.lock';
 my $startup_lock = $lock_file . ".startup";
 my $last_snapshot = {};
 my $last_mtime = 0;
@@ -309,6 +309,8 @@ sub _is_process_alive {
 # ============================================================================
 
 sub get_graphic_stats {
+    #  todo name the process without overruling other processes
+
     _debug(__LINE__, "get_graphic_stats called");
     
     # Start PVE Mod worker, if not already running
@@ -636,9 +638,6 @@ sub _pve_mod_starter {
 }
 
 sub _pve_mod_worker {
-    # Give the pid a unique name for easier identification
-    $0 = "pve_mod_worker";
-
     # Ensure directory exists
     my $run_dir = '/var/run/pve-gpu';
     unless (-d $run_dir) {
@@ -646,6 +645,27 @@ sub _pve_mod_worker {
         mkdir($run_dir, 0755) or _debug(__LINE__, "Failed to create $run_dir: $!");
     }
     
+    # Check if monitor is already running
+    if (-f $monitor_lock) {
+        _debug(__LINE__, "Monitor lock file exists, checking if monitor is alive");
+        if (open my $fh, '<', $monitor_lock) {
+            my $pid = <$fh>;
+            close $fh;
+            chomp $pid if defined $pid;
+            
+            if ($pid && $pid =~ /^\d+$/ && _is_process_alive($pid)) {
+                _debug(__LINE__, "Monitor process already running with PID $pid, don't start another pve_mod_worker");
+                return;
+            } else {
+                _debug(__LINE__, "Stale monitor lock found (PID: " . ($pid // 'undefined') . "), removing");
+                unlink $monitor_lock;
+            }
+        }
+
+    } else {
+        _debug(__LINE__, "PVE mod worker is not running. It can be started.");
+    }
+
     # Acquire startup lock and start application
     _pve_mod_starter();
 
@@ -661,7 +681,7 @@ sub _pve_mod_worker {
     _debug(__LINE__, "All collectors started");
 
     # Start gui activity monitor process
-    _start_monitor_process();
+    _pve_mod_monitor();
 
     # Remove startup lock LAST
     unlink($startup_lock);
@@ -670,8 +690,12 @@ sub _pve_mod_worker {
     _debug(__LINE__, "pve_mod_worker started successfully, returning");
 }
 
-sub _start_monitor_process {
-    _debug(__LINE__, "_start_monitor_process called");
+# ============================================================================
+# Monitor Process
+# ============================================================================
+
+sub _pve_mod_monitor {
+    _debug(__LINE__, "_pve_mod_monitor called");
     
     # Check if monitor is already running
     if (-f $monitor_lock) {
@@ -693,9 +717,6 @@ sub _start_monitor_process {
     
     _debug(__LINE__, "Forking new monitor process");
     my $monitor_pid = fork();
-    # give the process a unique name
-    $0 = "pve-mod-monitor";
-
     
     unless (defined $monitor_pid) {
         _debug(__LINE__, "Failed to fork monitor process: $!");
@@ -720,6 +741,7 @@ sub _start_monitor_process {
             kill('TERM', $monitor_pid);
         }
     }
+    _debug(__LINE__, "Monitor process started successfully");
 }
 
 sub _notify_monitor {
@@ -734,9 +756,18 @@ sub _notify_monitor {
         my $pid = <$fh>;
         close $fh;
         chomp $pid if defined $pid;
-        if ($pid && $pid =~ /^\d+$/ && _is_process_alive($pid)) {
-            _debug(__LINE__, "Sending USR1 signal to monitor PID $pid");
-            kill('USR1', $pid);
+        if ($pid && $pid =~ /^(\d+)$/) {
+            # Untaint by capturing in regex - $1 is now untainted
+            my $clean_pid = $1;
+            
+            if (_is_process_alive($clean_pid)) {
+                _debug(__LINE__, "Sending USR1 signal to monitor PID $clean_pid");
+                my $result = kill('USR1', $clean_pid);
+                _debug(__LINE__, "Signal result: $result");
+            } else {
+                _debug(__LINE__, "Monitor process $clean_pid is not alive, removing stale lock");
+                unlink($monitor_lock);
+            }
         } else {
             # Stale lock, remove it
             _debug(__LINE__, "Monitor lock is stale (PID: " . ($pid // 'undefined') . "), removing");
@@ -749,7 +780,6 @@ sub _notify_monitor {
 
 # In monitor process:
 sub _pve_mod_keep_alive {
-    $0 = "pve-mod-gpu-monitor";
     _debug(__LINE__, "Monitor process started with PID $$");
     
     my $last_activity = time();
@@ -761,49 +791,39 @@ sub _pve_mod_keep_alive {
     };
     $SIG{TERM} = sub {
         _debug(__LINE__, "Monitor received SIGTERM, shutting down");
-        unlink($monitor_lock);
+        unlink($monitor_lock) if -f $monitor_lock;
         exit(0);
     };
     $SIG{INT} = sub {
         _debug(__LINE__, "Monitor received SIGINT, shutting down");
-        unlink($monitor_lock);
+        unlink($monitor_lock) if -f $monitor_lock;
         exit(0);
     };
     
+    _debug(__LINE__, "Entering monitor loop, timeout=${COLLECTOR_TIMEOUT}s");
+    
     while (1) {
+        _debug(__LINE__, "Monitor loop start: checking activity");
+        
         my $idle_time = time() - $last_activity;
         
+        _debug(__LINE__, "Monitor loop: idle_time=${idle_time}s, timeout=${COLLECTOR_TIMEOUT}s");
+        
         if ($idle_time > $COLLECTOR_TIMEOUT) {
-            _debug(__LINE__, "No activity for ${idle_time}s (timeout: ${COLLECTOR_TIMEOUT}s), stopping collectors");
-            stop_collectors();
-            unlink($monitor_lock);
+            _debug(__LINE__, "Timeout reached, stopping collectors");
+            _stop_collectors();
+            _debug(__LINE__, "Collectors stopped, exiting monitor");
+            unlink($monitor_lock) if -f $monitor_lock;
             exit(0);
         }
-        
-        sleep(10);
-    }
-}
-
-sub cleanup {
-    unless ($is_collector_parent) {
-        _debug(__LINE__, "This process did not start collectors, skipping cleanup");
-        return;
+        sleep(1);
     }
     
-    _debug(__LINE__, "Starting cleanup (this should rarely happen)");
-    
-    # todo add remove of stat files
-
-    # DON'T cleanup automatically - collectors should keep running
-    # across worker process lifecycles
-    # Only cleanup if explicitly called
+    # Should never reach here
+    _debug(__LINE__, "Monitor loop exited unexpectedly!");
 }
 
-# Remove the END block that automatically calls cleanup
-# END { cleanup() }
-
-# Instead, add a manual cleanup function that can be called explicitly
-sub stop_collectors {
+sub _stop_collectors {
     _debug(__LINE__, "Stopping all collectors");
     
     # Read current PIDs from lock file
@@ -811,14 +831,16 @@ sub stop_collectors {
     if (open my $lock_fh, '<', $lock_file) {
         while (my $line = <$lock_fh>) {
             chomp $line;
-            push @pids, $line if $line =~ /^\d+$/;
+            # Extract PID from "PID card type" format
+            if ($line =~ /^(\d+)/) {
+                push @pids, $1;
+            }
         }
         close($lock_fh);
     }
     
     if (@pids) {
-        # Send SIGTERM to all collectors
-        _debug(__LINE__, "Sending SIGTERM to " . scalar(@pids) . " process(es)");
+        _debug(__LINE__, "Sending SIGTERM to " . scalar(@pids) . " collector process(es)");
         foreach my $pid (@pids) {
             kill('TERM', $pid) if kill(0, $pid);
         }
@@ -835,23 +857,25 @@ sub stop_collectors {
                 }
             }
             last unless $any_alive;
-            select(undef, undef, undef, 0.1); # sleep 0.1s
+            select(undef, undef, undef, 0.1);
         }
         
         # Force kill any survivors
         foreach my $pid (@pids) {
             if (kill(0, $pid)) {
-                _debug(__LINE__, "Force killing process $pid");
+                _debug(__LINE__, "Force killing collector process $pid");
                 kill('KILL', $pid);
             }
         }
     }
     
+    # Clean up files
     unlink $state_file if -f $state_file;
     unlink $lock_file if -f $lock_file;
+    
     _debug(__LINE__, "Cleanup complete");
 }
 
-END { cleanup() }
+END { _stop_collectors() }
 
 1;
