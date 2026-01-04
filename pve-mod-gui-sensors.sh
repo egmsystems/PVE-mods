@@ -228,6 +228,7 @@ function configure {
 				fi
 			done
 			ENABLE_INTEL_GPU_INFO=true
+			ENABLE_GPU_INFO=true
 		else
 			warn "No Intel GPUs detected by intel_gpu_top."
 			ENABLE_INTEL_GPU_INFO=false
@@ -459,6 +460,7 @@ function install_mod {
 
     generate_and_insert_widget "$ENABLE_SYSTEM_INFO" "generate_system_info" "system_info"
     generate_and_insert_widget "$ENABLE_UPS" "generate_ups_widget" "ups"
+	generate_and_insert_widget "$ENABLE_GPU_INFO" "generate_gpu_widget" "gpu"
     generate_and_insert_widget "$ENABLE_HDD_TEMP" "generate_hdd_widget" "hdd"
     generate_and_insert_widget "$ENABLE_NVME_TEMP" "generate_nvme_widget" "nvme"
 
@@ -602,22 +604,6 @@ collect_ups_output() {
 }
 
 collect_graphics_intel_output() {
-	local output_file="$1"
-	local intelCmd
-
-
-use threads;
-use JSON;
-
-my $snapshot;
-
-threads->create(sub {
-    while (1) {
-        my $json = `intel_gpu_top -J -s 1`;
-        $snapshot = decode_json($json);
-        sleep 1; # optional
-    }
-});
 
 
 }
@@ -772,6 +758,8 @@ add_visual_separator() {
     
     if [ "$ENABLE_UPS" = true ]; then
         lastItemId="upsc"
+    elif [ "$ENABLE_GPU" = true ]; then
+        lastItemId="gpuInfo"		
     elif [ "$ENABLE_HDD_TEMP" = true ]; then
         lastItemId="thermalHdd"
     elif [ "$ENABLE_NVME_TEMP" = true ]; then
@@ -1629,6 +1617,83 @@ EOF
     fi
 }
 
+# Function to generate GPU widget
+generate_gpu_widget() {
+	#region gpu widget heredoc
+	# use subshell to allow variable expansion
+	(
+		export CPU_ITEMS_PER_ROW
+		export CPU_TEMP_TARGET
+		export HELPERCTORPARAMS
+		
+		cat <<'EOF' | envsubst '$CPU_ITEMS_PER_ROW $CPU_TEMP_TARGET $HELPERCTORPARAMS' > "$1"
+		{
+            itemId: 'gpu',
+            colspan: 2,
+            iconCls: 'fa fa-desktop',
+            title: gettext('GPU(s)'),
+            printBar: false,
+            textField: 'gpuStats',
+            renderer: function(gpuStats) {
+                console.log(gpuStats);
+                if (!gpuStats || !gpuStats.Graphics || !gpuStats.Graphics.Intel) {
+                    return 'N/A';
+                }
+
+                let html = '';
+                
+                Object.keys(gpuStats.Graphics.Intel).forEach(key => {
+                    const gpuData = gpuStats.Graphics.Intel[key];
+                    console.log("here1");
+                    html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
+                    html += `<div style="text-align: left; flex: 1;">${gpuData.name}</div>`;
+                    html += `<div style="text-align: right; flex: 1;">`;
+                    
+                    if (gpuData.stats.engines) {
+                        console.log("here2");
+                        // Render/3D
+                        if (gpuData.stats.engines['Render/3D']) {
+                            html += `Render/3D: ${gpuData.stats.engines['Render/3D'].busy}% | `;
+                        }
+                        
+                        // Video
+                        if (gpuData.stats.engines['Video']) {
+                            html += `Video: ${gpuData.stats.engines['Video'].busy}% | `;
+                        }
+                        
+                        // Blitter
+                        if (gpuData.stats.engines['Blitter']) {
+                            html += `Blitter: ${gpuData.stats.engines['Blitter'].busy}% | `;
+                        }
+                        
+                        // VideoEnhance
+                        if (gpuData.stats.engines['VideoEnhance']) {
+                            html += `VideoEnhance: ${gpuData.stats.engines['VideoEnhance'].busy}% | `;
+                        }
+                    }
+                    
+                    // Power and Frequency info
+                    html += `Power: ${gpuData.stats.power?.GPU ?? 'N/A'} / ${gpuData.stats.power?.Package ?? 'N/A'} ${gpuData.stats.power?.unit || 'W'}`;
+                    html += ` | Freq: ${gpuData.stats.frequency?.actual ?? 'N/A'}/${gpuData.stats.frequency?.requested ?? 'N/A'} ${gpuData.frequency?.unit || 'MHz'}`;
+                    
+                    html += `</div></div>`;
+                });
+
+                // todo add NVIDIA
+
+                // todo add NVIDIA
+
+                return html;
+            },
+        },
+EOF
+	)
+	#endregion cpu widget heredoc
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to generate cpu widget code" >&2
+        exit 1
+    fi
+}
 #endregion widget generation functions
 
 # Function to uninstall the modification
