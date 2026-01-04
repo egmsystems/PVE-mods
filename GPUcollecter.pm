@@ -7,9 +7,11 @@ use POSIX qw(WNOHANG);
 use Fcntl qw(:flock);
 use Time::HiRes qw(time);
 use Fcntl qw(:flock O_CREAT O_EXCL O_WRONLY);
+use File::Path qw(remove_tree);
 
 # debug configuration - set to 0 to disable all _debug output
 my $debug_ENABLED = 1;
+my $VERSION = '1.0.0';
 
 # debug function showing line number and call chain
 # Usage: _debug(__LINE__, "message")
@@ -36,10 +38,11 @@ sub _debug {
     }
 }
 
-my $stats_dir = '/var/run/pve-gpu';
-my $state_file = '/var/run/pve-gpu/stats.json';
-my $lock_file = '/var/run/pve-gpu/pve-gpu-collector.lock';
-my $monitor_lock = '/var/run/pve-gpu/pve-mod-monitor.lock';
+my $pve_mod_working_dir = '/run/pveproxy/pve-mod';
+my $stats_dir = $pve_mod_working_dir;
+my $state_file = "$pve_mod_working_dir/stats.json";
+my $lock_file = "$pve_mod_working_dir/pve-mod-worker.lock";
+my $pve_mod_worker_lock = "$pve_mod_working_dir/pve-mod-pve_mod_worker.lock";
 my $startup_lock = $lock_file . ".startup";
 my $last_snapshot = {};
 my $last_mtime = 0;
@@ -50,8 +53,8 @@ my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic
 my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
 my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
 my $nvidia_gpu_enabled = 0; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
-my $monitor_pid;
-my $monitor_running = 0;
+my $pve_mod_worker_pid;
+my $pve_mod_worker_running = 0;
 
 # ============================================================================
 # Intel GPU Support
@@ -168,7 +171,7 @@ sub _collector_for_intel_device {
     my $intel_gpu_top_pid = undef;
     
     # Each device writes to its own file
-    my $device_state_file = "/var/run/pve-gpu/stats-$device->{card}.json";
+    my $device_state_file = "$pve_mod_working_dir/stats-$device->{card}.json";
     
     _debug(__LINE__, "Collector started for device: $drm_dev, writing to $device_state_file");
     
@@ -304,17 +307,105 @@ sub _is_process_alive {
     return -d "/proc/$pid";
 }
 
+sub _read_lock_pid {
+    my ($lock_path) = @_;
+    
+    return undef unless open(my $fh, '<', $lock_path);
+    
+    my $pid = <$fh>;
+    close($fh);
+    chomp $pid if defined $pid;
+    
+    return $pid;
+}
+
+sub _acquire_exclusive_lock {
+    my ($lock_path, $purpose) = @_;
+    $purpose //= 'lock';
+    
+    my $fh;
+
+    # Try to create lock file exclusively
+    if (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
+        _debug(__LINE__, "Acquired $purpose on first try");
+        return $fh;
+    }
+    
+    # Lock file creation failed - check if it's stale or held by another process
+    _debug(__LINE__, ucfirst($purpose) . " exists, checking if stale");
+    
+    my $lock_pid = _read_lock_pid($lock_path);
+    
+    if (!defined $lock_pid) {
+        _debug(__LINE__, "Could not read $purpose file: $!");
+        return undef;
+    }
+    
+    if ($lock_pid eq '' || $lock_pid !~ /^\d+$/) {
+        _debug(__LINE__, "Invalid PID in $purpose: '" . ($lock_pid // 'undefined') . "', removing");
+        unlink($lock_path);
+    } elsif (_is_process_alive($lock_pid)) {
+        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is still alive");
+        return undef;
+    } else {
+        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is dead, removing stale lock");
+        unlink($lock_path);
+    }
+    
+    # Try to acquire lock again after cleanup
+    unless (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
+        _debug(__LINE__, "Failed to acquire $purpose on retry: $!");
+        return undef;
+    }
+    
+    _debug(__LINE__, "Acquired $purpose after removing stale lock");
+    return $fh;
+}
+
+sub _is_lock_stale {
+    my ($lock_path) = @_;
+    
+    return 0 unless open(my $fh, '<', $lock_path);
+    
+    my $lock_pid = <$fh>;
+    chomp $lock_pid if defined $lock_pid;
+    close($fh);
+    
+    # Invalid or missing PID
+    return 1 unless defined $lock_pid && $lock_pid =~ /^\d+$/;
+    
+    # Valid PID but process is dead
+    return !_is_process_alive($lock_pid);
+}
+
+sub _ensure_pve_mod_directory_exists {
+    unless (-d $pve_mod_working_dir) {
+        _debug(__LINE__, "Creating directory $pve_mod_working_dir");
+        unless (mkdir($pve_mod_working_dir, 0755)) {
+            _debug(__LINE__, "Failed to create $pve_mod_working_dir: $!. PVE Mod cannot start.");
+            die "Failed to create $pve_mod_working_dir: $!";
+        }
+        _debug(__LINE__, "Directory $pve_mod_working_dir created");
+    } else {
+        _debug(__LINE__, "Directory $pve_mod_working_dir already exists");
+    }
+}
+
+sub _pve_mod_hello {
+    _debug(__LINE__, "PVE Mod is being started. Version $VERSION");
+}
+
 # ============================================================================
 # API calls
 # ============================================================================
 
 sub get_graphic_stats {
     #  todo name the process without overruling other processes
-
     _debug(__LINE__, "get_graphic_stats called");
+    _pve_mod_hello();
     
-    # Start PVE Mod worker, if not already running
-    _pve_mod_worker();
+    # Start PVE Mod
+    _pve_mod_starter();
     
     # Find all device-specific stat files
     my $dh;
@@ -397,8 +488,8 @@ sub get_graphic_stats {
     
     _debug(__LINE__, "Successfully merged " . scalar(keys %{$merged->{Graphics}->{Intel}}) . " device node(s)");
     
-    # Notify monitor of activity
-    _notify_monitor();
+    # Notify pve_mod_worker of activity
+    _notify_pve_mod_worker();
 
     return $last_snapshot;
 }
@@ -423,6 +514,7 @@ sub _start_graphics_collectors {
         _debug(__LINE__, "Lock file exists: $lock_file");
         if (open(my $lock_fh, '<', $lock_file)) {
             _debug(__LINE__, "Opened lock file for reading");
+            flock($lock_fh, LOCK_EX) or _debug(__LINE__, "Failed to lock $lock_file: $!");
             while (my $line = <$lock_fh>) {
                 chomp $line;
                 if ($line =~ /^(\d+)\s+(\S+)/) {
@@ -543,6 +635,7 @@ sub _start_graphics_collectors {
             my $card = $device->{card} // '';
             print $lock_fh "$pid $card $type\n";
         }
+        flock($lock_fh, LOCK_UN);
         close($lock_fh);
         _debug(__LINE__, "Wrote " . scalar(@child_pids) . " collector PID(s) to lock file");
     } else {
@@ -579,95 +672,30 @@ sub _start_graphics_collectors {
     _debug(__LINE__, "Graphics collectors started");
 }
 
+# ============================================================================
+# PVE Mod Worker
+# ============================================================================
 sub _pve_mod_starter {
-    # Try to acquire startup lock FIRST (prevents race conditions)
-    my $startup_fh;
-    
-    _debug(__LINE__, "Trying to acquire startup lock: $startup_lock");
-    
-    unless (sysopen($startup_fh, $startup_lock, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
-        # Startup lock exists - check if it's stale
-        _debug(__LINE__, "Startup lock exists, checking if stale");
-        
-        if (open(my $check_fh, '<', $startup_lock)) {
-            my $lock_pid = <$check_fh>;
-            chomp $lock_pid if defined $lock_pid;
-            close($check_fh);
-            
-            if (defined $lock_pid && $lock_pid =~ /^\d+$/) {
-                _debug(__LINE__, "Startup lock held by PID $lock_pid");
-
-                if (_is_process_alive($lock_pid)) {
-                    _debug(__LINE__, "Lock holder PID $lock_pid is still alive, waiting");
-                } else {
-                    # Lock holder is dead, remove stale lock
-                    _debug(__LINE__, "Lock holder PID $lock_pid is dead, removing stale startup lock");
-                    unlink($startup_lock);
-                    
-                    # Try to acquire lock again
-                    unless (sysopen($startup_fh, $startup_lock, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
-                        _debug(__LINE__, "Failed to acquire startup lock on retry: $!");
-                        return;
-                    }
-                    _debug(__LINE__, "Acquired startup lock after removing stale lock");
-                }
-            } else {
-                # Invalid PID in lock file, remove it
-                _debug(__LINE__, "Invalid PID in startup lock, removing");
-                unlink($startup_lock);
-                
-                # Try to acquire lock again
-                unless (sysopen($startup_fh, $startup_lock, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
-                    _debug(__LINE__, "Failed to acquire startup lock on retry: $!");
-                    return;
-                }
-                _debug(__LINE__, "Acquired startup lock after removing invalid lock");
-            }
-        } else {
-            _debug(__LINE__, "Could not read startup lock file: $!");
-            return;
-        }
-    } else {
-        _debug(__LINE__, "Acquired startup lock on first try");
+    # Check if pve_mod_worker is already running - if so, entire system is already up
+    _debug(__LINE__, "Checking if pve_mod_worker is already running");
+    if (_is_pve_mod_worker_running()) {
+        _debug(__LINE__, "pve_mod_worker process already running, system is already started");
+        return "pve_mod_worker process already running, system is already started";
     }
-    
-    # We have the startup lock
+    _debug(__LINE__, "PVE mod worker is not running. PVE Mod will be started.");
+
+    # Ensure directory exists
+    _ensure_pve_mod_directory_exists();
+
+    # Try to acquire startup lock FIRST (prevents race conditions)
+    _debug(__LINE__, "Trying to acquire startup lock: $startup_lock");
+    my $startup_fh = _acquire_exclusive_lock($startup_lock, 'startup lock');
+    return unless $startup_fh;
     print $startup_fh "$$\n";
     close($startup_fh);
     _debug(__LINE__, "Wrote PID, $$, to startup lock");
-}
-
-sub _pve_mod_worker {
-    # Ensure directory exists
-    my $run_dir = '/var/run/pve-gpu';
-    unless (-d $run_dir) {
-        _debug(__LINE__, "Creating directory $run_dir");
-        mkdir($run_dir, 0755) or _debug(__LINE__, "Failed to create $run_dir: $!");
-    }
     
-    # Check if monitor is already running
-    if (-f $monitor_lock) {
-        _debug(__LINE__, "Monitor lock file exists, checking if monitor is alive");
-        if (open my $fh, '<', $monitor_lock) {
-            my $pid = <$fh>;
-            close $fh;
-            chomp $pid if defined $pid;
-            
-            if ($pid && $pid =~ /^\d+$/ && _is_process_alive($pid)) {
-                _debug(__LINE__, "Monitor process already running with PID $pid, don't start another pve_mod_worker");
-                return;
-            } else {
-                _debug(__LINE__, "Stale monitor lock found (PID: " . ($pid // 'undefined') . "), removing");
-                unlink $monitor_lock;
-            }
-        }
-
-    } else {
-        _debug(__LINE__, "PVE mod worker is not running. It can be started.");
-    }
-
-    # Acquire startup lock and start application
-    _pve_mod_starter();
+    
 
     # Start graphics collectors
     _start_graphics_collectors();
@@ -680,8 +708,8 @@ sub _pve_mod_worker {
 
     _debug(__LINE__, "All collectors started");
 
-    # Start gui activity monitor process
-    _pve_mod_monitor();
+    # Start pve mod workers
+    _pve_mod_worker();
 
     # Remove startup lock LAST
     unlink($startup_lock);
@@ -691,96 +719,83 @@ sub _pve_mod_worker {
 }
 
 # ============================================================================
-# Monitor Process
+# PVE Mod Worker
 # ============================================================================
 
-sub _pve_mod_monitor {
-    _debug(__LINE__, "_pve_mod_monitor called");
+sub _pve_mod_worker {
+    _debug(__LINE__, "_pve_mod_worker called");
     
-    # Check if monitor is already running
-    if (-f $monitor_lock) {
-        _debug(__LINE__, "Monitor lock file exists, checking if monitor is alive");
-        if (open my $fh, '<', $monitor_lock) {
-            my $pid = <$fh>;
-            close $fh;
-            chomp $pid if defined $pid;
-            
-            if ($pid && $pid =~ /^\d+$/ && _is_process_alive($pid)) {
-                _debug(__LINE__, "Monitor process already running with PID $pid");
-                return;
-            } else {
-                _debug(__LINE__, "Stale monitor lock found (PID: " . ($pid // 'undefined') . "), removing");
-                unlink($monitor_lock);
-            }
-        }
-    }
+    # Check if worker is already running
+    my $pve_mod_worker_fh = _acquire_exclusive_lock($pve_mod_worker_lock, 'pve_mod_worker lock');
+    return unless $pve_mod_worker_fh;
+    print $pve_mod_worker_fh "$$\n";
+    close($pve_mod_worker_fh);
     
-    _debug(__LINE__, "Forking new monitor process");
-    my $monitor_pid = fork();
+    _debug(__LINE__, "Forking new pve_mod_worker process");
+    my $pve_mod_worker_pid = fork();
     
-    unless (defined $monitor_pid) {
-        _debug(__LINE__, "Failed to fork monitor process: $!");
+    unless (defined $pve_mod_worker_pid) {
+        _debug(__LINE__, "Failed to fork pve_mod_worker process: $!");
         return;
     }
     
-    if ($monitor_pid == 0) {
-        # Child process - run the monitor
+    if ($pve_mod_worker_pid == 0) {
+        # Child process - run the pve_mod_worker
         _debug(__LINE__, "Child process forked, calling _pve_mod_keep_alive");
         _pve_mod_keep_alive();
         exit(0);  # Should never reach here
     } else {
         # Parent process - write PID to lock file
-        _debug(__LINE__, "Forked monitor process with PID $monitor_pid");
+        _debug(__LINE__, "Forked pve_mod_worker process with PID $pve_mod_worker_pid");
         
-        if (open my $fh, '>', $monitor_lock) {
-            print $fh "$monitor_pid\n";
+        if (open my $fh, '>', $pve_mod_worker_lock) {
+            print $fh "$pve_mod_worker_pid\n";
             close $fh;
-            _debug(__LINE__, "Wrote monitor PID to lock file: $monitor_lock");
+            _debug(__LINE__, "Wrote pve_mod_worker PID to lock file: $pve_mod_worker_lock");
         } else {
-            _debug(__LINE__, "Failed to write monitor lock file: $!");
-            kill('TERM', $monitor_pid);
+            _debug(__LINE__, "Failed to write pve_mod_worker lock file: $!");
+            kill('TERM', $pve_mod_worker_pid);
         }
     }
-    _debug(__LINE__, "Monitor process started successfully");
+    _debug(__LINE__, "pve_mod_worker process started successfully");
 }
 
-sub _notify_monitor {
-    _debug(__LINE__, "_notify_monitor called");
-    unless (-f $monitor_lock) {
-        _debug(__LINE__, "Monitor lock file does not exist");
+sub _notify_pve_mod_worker {
+    _debug(__LINE__, "_notify_pve_mod_worker called");
+    unless (-f $pve_mod_worker_lock) {
+        _debug(__LINE__, "pve_mod_worker lock file does not exist");
         return;
     }
 
-    _debug(__LINE__, "Monitor lock file exists, reading PID");
-    if (open my $fh, '<', $monitor_lock) {
+    _debug(__LINE__, "pve_mod_worker lock file exists, reading PID");
+    if (open my $fh, '<', $pve_mod_worker_lock) {
         my $pid = <$fh>;
         close $fh;
         chomp $pid if defined $pid;
-        if ($pid && $pid =~ /^(\d+)$/) {
+        if (defined $pid && $pid =~ /^(\d+)$/) {
             # Untaint by capturing in regex - $1 is now untainted
             my $clean_pid = $1;
             
             if (_is_process_alive($clean_pid)) {
-                _debug(__LINE__, "Sending USR1 signal to monitor PID $clean_pid");
+                _debug(__LINE__, "Sending USR1 signal to pve_mod_worker PID $clean_pid");
                 my $result = kill('USR1', $clean_pid);
                 _debug(__LINE__, "Signal result: $result");
             } else {
-                _debug(__LINE__, "Monitor process $clean_pid is not alive, removing stale lock");
-                unlink($monitor_lock);
+                _debug(__LINE__, "pve_mod_worker process $clean_pid is not alive, removing stale lock");
+                unlink($pve_mod_worker_lock);
             }
         } else {
             # Stale lock, remove it
-            _debug(__LINE__, "Monitor lock is stale (PID: " . ($pid // 'undefined') . "), removing");
-            unlink($monitor_lock);
+            _debug(__LINE__, "pve_mod_worker lock is stale (PID: " . ($pid // 'undefined') . "), removing");
+            unlink($pve_mod_worker_lock);
         }
     } else {
-        _debug(__LINE__, "Failed to open monitor lock file: $!");
+        _debug(__LINE__, "Failed to open pve_mod_worker lock file: $!");
     }
 }
 
-# In monitor process:
 sub _pve_mod_keep_alive {
-    _debug(__LINE__, "Monitor process started with PID $$");
+    _debug(__LINE__, "pve_mod_worker process started with PID $$");
     
     my $last_activity = time();
     
@@ -790,38 +805,46 @@ sub _pve_mod_keep_alive {
         _debug(__LINE__, "Activity ping received");
     };
     $SIG{TERM} = sub {
-        _debug(__LINE__, "Monitor received SIGTERM, shutting down");
-        unlink($monitor_lock) if -f $monitor_lock;
+        _debug(__LINE__, "pve_mod_worker received SIGTERM, shutting down");
+        unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
     $SIG{INT} = sub {
-        _debug(__LINE__, "Monitor received SIGINT, shutting down");
-        unlink($monitor_lock) if -f $monitor_lock;
+        _debug(__LINE__, "pve_mod_worker received SIGINT, shutting down");
+        unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
     
-    _debug(__LINE__, "Entering monitor loop, timeout=${COLLECTOR_TIMEOUT}s");
+    _debug(__LINE__, "Entering pve_mod_worker loop, timeout=${COLLECTOR_TIMEOUT}s");
     
     while (1) {
-        _debug(__LINE__, "Monitor loop start: checking activity");
+        _debug(__LINE__, "pve_mod_worker loop start: checking activity");
         
         my $idle_time = time() - $last_activity;
         
-        _debug(__LINE__, "Monitor loop: idle_time=${idle_time}s, timeout=${COLLECTOR_TIMEOUT}s");
+        _debug(__LINE__, "pve_mod_worker loop: idle_time=${idle_time}s, timeout=${COLLECTOR_TIMEOUT}s");
         
         if ($idle_time > $COLLECTOR_TIMEOUT) {
             _debug(__LINE__, "Timeout reached, stopping collectors");
             _stop_collectors();
-            _debug(__LINE__, "Collectors stopped, exiting monitor");
-            unlink($monitor_lock) if -f $monitor_lock;
+            _debug(__LINE__, "Collectors stopped, exiting pve_mod_worker");
+            unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
             exit(0);
         }
         sleep(1);
     }
     
     # Should never reach here
-    _debug(__LINE__, "Monitor loop exited unexpectedly!");
+    _debug(__LINE__, "pve_mod_worker loop exited unexpectedly!");
 }
+
+sub _is_pve_mod_worker_running {
+    return -f $pve_mod_worker_lock;
+}
+
+# ============================================================================
+# Other
+# ============================================================================
 
 sub _stop_collectors {
     _debug(__LINE__, "Stopping all collectors");
@@ -838,13 +861,16 @@ sub _stop_collectors {
         }
         close($lock_fh);
     }
-    
+    _debug(__LINE__, "Cleanup complete_1");
+
     if (@pids) {
         _debug(__LINE__, "Sending SIGTERM to " . scalar(@pids) . " collector process(es)");
         foreach my $pid (@pids) {
             kill('TERM', $pid) if kill(0, $pid);
         }
         
+        _debug(__LINE__, "Cleanup complete_2");
+
         # Wait up to 5 seconds for graceful shutdown
         my $timeout = 5;
         my $start = time();
@@ -859,7 +885,7 @@ sub _stop_collectors {
             last unless $any_alive;
             select(undef, undef, undef, 0.1);
         }
-        
+        _debug(__LINE__, "Cleanup complete_3");
         # Force kill any survivors
         foreach my $pid (@pids) {
             if (kill(0, $pid)) {
@@ -867,13 +893,23 @@ sub _stop_collectors {
                 kill('KILL', $pid);
             }
         }
+        _debug(__LINE__, "Cleanup complete_4");
     }
     
-    # Clean up files
-    unlink $state_file if -f $state_file;
-    unlink $lock_file if -f $lock_file;
+    if (-f $state_file) {
+        unlink $state_file or _debug(__LINE__, "Failed to remove $state_file: $!");
+    }
+    if (-f $lock_file) {
+        unlink $lock_file or _debug(__LINE__, "Failed to remove $lock_file: $!");
+    }
     
-    _debug(__LINE__, "Cleanup complete");
+    # Remove pve mod worker directory and all files if it exists
+    if (-d $pve_mod_working_dir) {
+        remove_tree($pve_mod_working_dir, { error => \my $err });
+        _debug(__LINE__, "Cleanup errors: @$err") if @$err;
+    }
+
+    _debug(__LINE__, "Cleanup complete_5");
 }
 
 END { _stop_collectors() }
