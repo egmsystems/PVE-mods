@@ -219,7 +219,7 @@ sub _collector_for_intel_device {
                 # Build device-specific structure (just the node, not the full Graphics/Intel hierarchy)
                 my $device_data = {
                     $node_name => {
-                        gpu_name => $device->{name},
+                        name => $device->{name},
                         device_path => $device->{path},
                         drm_path => $device->{drm_path},
                         stats => $stats
