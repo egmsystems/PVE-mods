@@ -52,7 +52,7 @@ my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic
 
 my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
 my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
-my $nvidia_gpu_enabled = 0; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
+my $nvidia_gpu_enabled = 1; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
 my $pve_mod_worker_pid;
 my $pve_mod_worker_running = 0;
 
@@ -137,6 +137,7 @@ sub _get_intel_gpu_devices {
     
     return @devices unless -x '/usr/bin/intel_gpu_top';
     
+    _debug(__LINE__, "Getting Intel GPU devices");
     if (open my $fh, '-|', 'intel_gpu_top -L') {
         while (<$fh>) {
             chomp;
@@ -152,7 +153,7 @@ sub _get_intel_gpu_devices {
                     path => $path,
                     drm_path => "/dev/dri/$card"
                 };
-                _debug(__LINE__, "Found GPU device: $card -> $name ($path)");
+                _debug(__LINE__, "Found Intel device: $card -> $name ($path)");
             }
         }
         close $fh;
@@ -276,25 +277,123 @@ sub _collector_for_amd_device {
 # ============================================================================
 
 sub get_nvidia_gpu_devices {
-    # TODO: Implement NVIDIA GPU detection
-    # Use nvidia-smi to detect NVIDIA GPUs
-    _debug(__LINE__, "NVIDIA GPU support not yet implemented");
-    return ();
+    my @devices = ();
+    
+    # Expected format (CSV with header):
+    # index, name
+    # 0, NVIDIA GeForce RTX 3080
+    # 1, NVIDIA RTX A4000
+
+    # add debug mode where Expected format is loaded from a file instead or calling nvidia-smi
+    my $debug_file = '/tmp/nvidia-smi-debug.csv';
+    my $use_debug_file = 1;  # Set to 1 to enable debug mode
+    
+    # todo - delete this block later
+    if ($use_debug_file && -f $debug_file) {
+        _debug(__LINE__, "Debug mode: reading NVIDIA GPU data from $debug_file");
+        if (open my $fh, '<', $debug_file) {
+            while (<$fh>) {
+                chomp;
+                # Skip empty lines
+                next if /^\s*$/;
+                
+                # Parse CSV: "0, NVIDIA GeForce RTX 3080"
+                if (/^\s*(\d+)\s*,\s*(.+?)\s*$/) {
+                    my $index = $1;
+                    my $name = $2;
+                    push @devices, {
+                        name => $name,
+                        index => $index,
+                    };
+                    _debug(__LINE__, "Found NVIDIA GPU device (debug): $name -> (index: $index)");
+                }
+            }
+            close $fh;
+        } else {
+            _debug(__LINE__, "Failed to open debug file $debug_file: $!");
+        }
+    }
+    return @devices;
+
+
+    # if (open my $fh, '-|', 'nvidia-smi --query-gpu=index,name --format=csv') {
+    #     while (<$fh>) {
+    #         chomp;
+    #         # Skip empty lines
+    #         next if /^\s*$/;
+            
+    #         # Parse CSV: "0, NVIDIA GeForce RTX 3080"
+    #         if (/^\s*(\d+)\s*,\s*(.+?)\s*$/) {
+    #             my $index = $1;
+    #             my $name = $2;
+    #             push @devices, {
+    #                 name => $name,
+    #                 index => $index,
+    #             };
+    #             _debug(__LINE__, "Found NVIDIA GPU device: $name -> (index: $index)");
+    #         }
+    #     }
+    #     close $fh;
+    # } else {
+    #     _debug(__LINE__, "Failed to run nvidia-smi: $!");
+    # }
+    
+    # return @devices;
 }
 
 sub parse_nvidia_gpu_line {
     my ($line) = @_;
-    # TODO: Implement NVIDIA GPU line parsing
-    # Parse nvidia-smi output
-    _debug(__LINE__, "NVIDIA GPU line parsing not yet implemented");
-    return undef;
+
+    # Expected format (CSV) for multiple GPUs:
+    # index, name, temperature.gpu, utilization.gpu, utilization.memory, memory.used, memory.total, power.draw, power.limit, fan.speed
+    #0, NVIDIA GeForce RTX 3080, 62, 79, 44, 8260, 10240, 268.12, 320.00, 67
+
+    # Remove leading/trailing whitespace
+    $line =~ s/^\s+|\s+$//g;
+    
+    # Skip empty lines
+    return unless $line;
+    
+    # Split by comma and trim whitespace from each field
+    my @values = map { s/^\s+|\s+$//gr } split(/,/, $line);
+    
+    # Expected: index(0), name(1), temp(2), util_gpu(3), util_mem(4), mem_used(5), mem_total(6), power_draw(7), power_limit(8), fan_speed(9)
+    return unless @values >= 10;
+    
+    my $stats = {
+        index => $values[0] + 0,
+        name => $values[1],
+        temperature => {
+            gpu => $values[2] + 0.0,
+            unit => "°C"
+        },
+        utilization => {
+            gpu => $values[3] + 0.0,
+            memory => $values[4] + 0.0,
+            unit => "%"
+        },
+        memory => {
+            used => $values[5] + 0.0,
+            total => $values[6] + 0.0,
+            unit => "MiB"
+        },
+        power => {
+            draw => $values[7] + 0.0,
+            limit => $values[8] + 0.0,
+            unit => "W"
+        },
+        fan => {
+            speed => $values[9] + 0.0,
+            unit => "%"
+        }
+    };
+    
+    return $stats;
 }
 
 sub collector_for_nvidia_device {
     my ($device) = @_;
-    # TODO: Implement NVIDIA GPU collector
-    _debug(__LINE__, "NVIDIA GPU collector not yet implemented");
-    exit 0;
+    # nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed --format=csv,nounits,noheader --loop=1
 }
 
 # ============================================================================
@@ -543,15 +642,13 @@ sub _start_graphics_collectors {
         _debug(__LINE__, "Checking for intel_gpu_top");
         unless (-x '/usr/bin/intel_gpu_top') {
             _debug(__LINE__, "intel_gpu_top not executable");
-            unlink($startup_lock);
             return;
         }
         _debug(__LINE__, "intel_gpu_top is executable");
-        _debug(__LINE__, "Getting Intel GPU devices");
+        
         my @intel_devices = _get_intel_gpu_devices();
         unless (@intel_devices) {
             _debug(__LINE__, "No Intel GPU devices found");
-            unlink($startup_lock);
             return;
         }
         _debug(__LINE__, "Found " . scalar(@intel_devices) . " Intel GPU device(s)");
@@ -571,6 +668,15 @@ sub _start_graphics_collectors {
     }
     # NVIDIA (future)
     if ($nvidia_gpu_enabled) {
+        _debug(__LINE__, "NVIDIA GPU support enabled");
+
+        # _debug(__LINE__, "Checking for nvidia-smi");
+        # unless (-x '/usr/bin/nvidia-smi') {
+        #     _debug(__LINE__, "nvidia-smi not executable");
+        #     return;
+        # }
+        _debug(__LINE__, "nvidia-smi is executable");
+
         my @nvidia_devices = get_nvidia_gpu_devices();
         _debug(__LINE__, "Got " . scalar(@nvidia_devices) . " NVIDIA devices");
         foreach my $device (@nvidia_devices) {
