@@ -490,6 +490,18 @@ sub _ensure_pve_mod_directory_exists {
     }
 }
 
+# Generic function to check if required executable exists
+sub _check_executable {
+    my ($exec_path, $type) = @_;
+    
+    unless (-x $exec_path) {
+        _debug(__LINE__, "$exec_path not executable for $type");
+        return 0;
+    }
+    _debug(__LINE__, "$exec_path is executable");
+    return 1;
+}
+
 sub _pve_mod_hello {
     _debug(__LINE__, "PVE Mod is being started. Version $VERSION");
 }
@@ -640,11 +652,8 @@ sub _start_graphics_collectors {
     if ($intel_gpu_enabled) {
         _debug(__LINE__, "Intel GPU support enabled");
         _debug(__LINE__, "Checking for intel_gpu_top");
-        unless (-x '/usr/bin/intel_gpu_top') {
-            _debug(__LINE__, "intel_gpu_top not executable");
-            return;
-        }
-        _debug(__LINE__, "intel_gpu_top is executable");
+        
+        return unless _check_executable('/usr/bin/intel_gpu_top', 'Intel');
         
         my @intel_devices = _get_intel_gpu_devices();
         unless (@intel_devices) {
@@ -659,6 +668,10 @@ sub _start_graphics_collectors {
     }
     # AMD (future)
     if ($amd_gpu_enabled) {
+        _debug(__LINE__, "AMD GPU support enabled");
+
+        return unless _check_executable('/usr/bin/rocm-smi', 'AMD');
+
         my @amd_devices = _get_amd_gpu_devices();
         _debug(__LINE__, "Got " . scalar(@amd_devices) . " AMD devices");
         foreach my $device (@amd_devices) {
@@ -670,12 +683,7 @@ sub _start_graphics_collectors {
     if ($nvidia_gpu_enabled) {
         _debug(__LINE__, "NVIDIA GPU support enabled");
 
-        # _debug(__LINE__, "Checking for nvidia-smi");
-        # unless (-x '/usr/bin/nvidia-smi') {
-        #     _debug(__LINE__, "nvidia-smi not executable");
-        #     return;
-        # }
-        _debug(__LINE__, "nvidia-smi is executable");
+        # return unless _check_executable('/usr/bin/nvidia-smi', 'NVIDIA');
 
         my @nvidia_devices = get_nvidia_gpu_devices();
         _debug(__LINE__, "Got " . scalar(@nvidia_devices) . " NVIDIA devices");
