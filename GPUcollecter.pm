@@ -42,9 +42,11 @@ my $pve_mod_working_dir = '/run/pveproxy/pve-mod';
 my $stats_dir = $pve_mod_working_dir;
 my $state_file = "$pve_mod_working_dir/stats.json";
 my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
-my $lock_file = "$pve_mod_working_dir/pve-mod-worker.lock";
-my $pve_mod_worker_lock = "$pve_mod_working_dir/pve-mod-pve_mod_worker.lock";
-my $startup_lock = $lock_file . ".startup";
+my $ups_state_file = "$pve_mod_working_dir/ups.json";
+
+my $collectors_pid_file = "$pve_mod_working_dir/collectors.pids"; # List of collector PIDs
+my $pve_mod_worker_lock = "$pve_mod_working_dir/pve-mod-pve_mod_worker.lock"; # PVE Mod worker lock 
+my $startup_lock = "$pve_mod_working_dir/startup.lock";  # Exclusive startup lock
 my $last_snapshot = {};
 my $last_mtime = 0;
 my $is_collector_parent = 0;  # Flag to track if this process started collectors
@@ -54,8 +56,14 @@ my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic
 my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
 my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
 my $nvidia_gpu_enabled = 1; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
+my $ups_enabled = 1; # Set to 1 to enable UPS support
 my $pve_mod_worker_pid;
 my $pve_mod_worker_running = 0;
+
+# UPS Configuration
+my $ups_device = {
+    ups_name => 'ups@192.168.3.2',  # Format: upsname[@hostname[:port]]
+};
 
 # ============================================================================
 # Intel GPU Support
@@ -603,7 +611,7 @@ sub _get_temperature_sensors {
     };
     $sensorsData = JSON->new->pretty->encode($enhanced_data);
 
-    
+
 
     return $sensorsData;
 }
@@ -986,10 +994,135 @@ sub _cpu_model_by_package {
 }
 
 # ============================================================================
+# UPS Support
+# ============================================================================
+
+sub _collector_for_ups {
+    my ($device) = @_;
+    
+    $0 = "pve-mod-ups-collector";
+    _debug(__LINE__, "UPS collector started");
+    
+    # Set up signal handlers for graceful shutdown
+    my $shutdown = 0;
+    $SIG{TERM} = sub {
+        _debug(__LINE__, "UPS collector received SIGTERM");
+        $shutdown = 1;
+    };
+    $SIG{INT} = sub {
+        _debug(__LINE__, "UPS collector received SIGINT");
+        $shutdown = 1;
+    };
+    while (!$shutdown) {
+        my $upsData = _get_ups_status($device->{ups_name});
+
+        # Write to ups state file
+        eval {
+            open my $ofh, '>', $ups_state_file or die "Failed to open $ups_state_file: $!";
+            print $ofh $upsData;
+            close $ofh;
+            _debug(__LINE__, "Wrote ups data to $ups_state_file");
+        };
+        if ($@) {
+            _debug(__LINE__, "Error writing ups data: $@");
+        }
+
+        sleep 1 unless $shutdown;
+    }
+    _debug(__LINE__, "UPS collector shutting down");
+    exit 0;
+}
+
+sub _get_ups_status {
+    my ($ups_name) = @_;
+
+    # upsc upsname[@hostname[:port]]
+    my $cmd = "upsc $ups_name 2>/dev/null";
+    
+    _debug(__LINE__, "Running command: $cmd");
+    
+    # Execute command and capture output
+    my $output = `$cmd`;
+
+    _debug(__LINE__, "upsc command output collected");
+
+    my $exit_code = $? >> 8;
+    
+    _debug(__LINE__, "upsc command exited with code $exit_code");
+
+    if ($exit_code != 0) {
+        _debug(__LINE__, "upsc command failed with exit code $exit_code");
+        return encode_json({ error => "Failed to execute upsc for $ups_name" });
+    }
+    
+    _debug(__LINE__, "upsc command executed successfully");
+
+    # Convert upsc output to nested hash structure
+    my $ups_data = _parse_upsc_output($output);
+
+    _debug(__LINE__, "Parsed upsc output for $ups_name");
+    
+    # Check if we got any data
+    unless (keys %$ups_data) {
+        _debug(__LINE__, "No data received from upsc for $ups_name");
+        return encode_json({ error => "No data from UPS $ups_name" });
+    }
+    
+    # Wrap in UPS name structure
+    my $result = {
+        $ups_name => $ups_data
+    };
+    
+    _debug(__LINE__, "Successfully parsed UPS data for $ups_name");
+    
+    # Return as pretty JSON
+    return JSON->new->pretty->canonical->encode($result);
+}
+
+sub _parse_upsc_output {
+    my ($output) = @_;
+    
+    my $ups_data = {};
+    
+    _debug(__LINE__, "Parsing upsc output");
+
+    eval {
+        foreach my $line (split /\n/, $output) {
+            # Skip empty lines and SSL init message
+            next if $line =~ /^\s*$/;
+            next if $line =~ /^Init SSL/;
+            
+            # Parse key-value pairs (format: "key: value")
+            if ($line =~ /^([^:]+):\s*(.*)$/) {
+                my ($key, $value) = ($1, $2);
+
+                # Trim whitespace
+                $key =~ s/^\s+|\s+$//g;
+                $value =~ s/^\s+|\s+$//g;
+                
+                # Store as flat key-value pairs (no nesting)
+                # Convert numeric values to numbers, keep strings as strings
+                if ($value =~ /^-?\d+\.?\d*$/) {
+                    $ups_data->{$key} = $value + 0;
+                } else {
+                    $ups_data->{$key} = $value;
+                }
+            }
+        }
+    };
+    if ($@) {
+        _debug(__LINE__, "Error parsing upsc output: $@");
+    }
+    
+    _debug(__LINE__, "Completed parsing upsc output");
+
+    return $ups_data;
+}
+
+# ============================================================================
 # Supporting functions
 # ============================================================================
 
-# Check if a process is alive
 sub _is_process_alive {
     my ($pid) = @_;
     return -d "/proc/$pid";
@@ -1226,6 +1359,38 @@ sub get_sensors_stats {
     return $sensors_data;
 }
 
+sub get_ups_stats {
+    _debug(__LINE__, "get_ups_stats called");
+
+    # Start PVE Mod
+    _pve_mod_starter();
+
+    unless (-f $ups_state_file) {
+        _debug(__LINE__, "UPS state file does not exist: $ups_state_file");
+        return {};
+    }
+
+    my $ups_data;
+    eval {
+        open my $fh, '<', $ups_state_file or die "Failed to open $ups_state_file: $!";
+        local $/;
+        my $json = <$fh>;
+        close($fh);
+        $ups_data = $json;
+        _debug(__LINE__, "Read UPS data, JSON length: " . length($json) . " bytes");
+        _debug(__LINE__, "Read UPS data from $ups_state_file");
+    };
+    if ($@) {
+        _debug(__LINE__, "Failed to read/parse UPS data: $@");
+        return {};
+    }
+
+    # Notify pve_mod_worker of activity
+    _notify_pve_mod_worker();
+
+    return $ups_data;
+}
+
 # ============================================================================
 # Main Collector
 # ============================================================================
@@ -1241,7 +1406,7 @@ sub _start_graphics_collectors {
     }
 
     # Read existing collectors from lock file
-    my %existing_collectors = _read_collector_lock($lock_file);
+    my %existing_collectors = _read_collector_lock($collectors_pid_file);
     
     # Generalized device collector management for future AMD/NVIDIA support
     my @all_devices;
@@ -1307,7 +1472,7 @@ sub _start_graphics_collectors {
         my $device_name = $device->{card} // $device->{name} // "device$i";
         
         # Check if collector already running
-        my $existing_pid = _is_collector_running($device_name, $lock_file);
+        my $existing_pid = _is_collector_running($device_name, $collectors_pid_file);
         if ($existing_pid) {
             _debug(__LINE__, "Collector for $type $device_name already running with PID $existing_pid");
             push @collector_entries, [$existing_pid, $device_name, $type];
@@ -1322,7 +1487,7 @@ sub _start_graphics_collectors {
     }
     
     # Write all collector PIDs to lock file
-    unless (_write_collector_lock($lock_file, @collector_entries)) {
+    unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
         _debug(__LINE__, "Failed to write lock file, terminating collectors");
         foreach my $entry (@collector_entries) {
             kill 'TERM', $entry->[0];
@@ -1363,7 +1528,7 @@ sub _start_sensors_collector {
     }
     
     # Check if already running
-    my $existing_pid = _is_collector_running('sensors', $lock_file);
+    my $existing_pid = _is_collector_running('sensors', $collectors_pid_file);
     if ($existing_pid) {
         _debug(__LINE__, "Sensors collector already running with PID $existing_pid");
         return;
@@ -1375,7 +1540,7 @@ sub _start_sensors_collector {
     if ($pid) {
         # Read existing entries
         my @collector_entries;
-        my %existing = _read_collector_lock($lock_file);
+        my %existing = _read_collector_lock($collectors_pid_file);
         foreach my $name (keys %existing) {
             push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
         }
@@ -1384,7 +1549,7 @@ sub _start_sensors_collector {
         push @collector_entries, [$pid, 'sensors', 'sensors'];
         
         # Write updated lock file
-        unless (_write_collector_lock($lock_file, @collector_entries)) {
+        unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
             _debug(__LINE__, "Failed to update lock file, terminating sensors collector");
             kill 'TERM', $pid;
             return;
@@ -1396,6 +1561,59 @@ sub _start_sensors_collector {
             _debug(__LINE__, "Verified sensors collector (PID $pid) is alive");
         } else {
             _debug(__LINE__, "WARNING - Sensors collector (PID $pid) died immediately!");
+        }
+    }
+}
+
+sub _start_ups_collector {
+
+    if ($ups_enabled == 0) {
+        _debug(__LINE__, "UPS support not enabled, skipping collector startup");
+        return;
+    }
+
+    _debug(__LINE__, "Starting UPS collector");
+    
+    # Check if UPS is configured
+    unless (defined $ups_device && $ups_device->{ups_name}) {
+        _debug(__LINE__, "No UPS configured, skipping collector startup");
+        return;
+    }
+    
+    # Check if already running
+    my $existing_pid = _is_collector_running('ups', $collectors_pid_file);
+    if ($existing_pid) {
+        _debug(__LINE__, "UPS collector already running with PID $existing_pid");
+        return;
+    }
+    
+    # Start the collector
+    my $pid = _start_child_collector('ups', \&_collector_for_ups, $ups_device);
+    
+    if ($pid) {
+        # Read existing entries
+        my @collector_entries;
+        my %existing = _read_collector_lock($collectors_pid_file);
+        foreach my $name (keys %existing) {
+            push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
+        }
+        
+        # Add UPS entry
+        push @collector_entries, [$pid, 'ups', 'ups'];
+        
+        # Write updated lock file
+        unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
+            _debug(__LINE__, "Failed to update lock file, terminating UPS collector");
+            kill 'TERM', $pid;
+            return;
+        }
+        
+        # Verify it's alive
+        sleep 0.1;
+        if (kill(0, $pid)) {
+            _debug(__LINE__, "Verified UPS collector (PID $pid) is alive");
+        } else {
+            _debug(__LINE__, "WARNING - UPS collector (PID $pid) died immediately!");
         }
     }
 }
@@ -1418,12 +1636,22 @@ sub _pve_mod_starter {
     # Ensure directory exists
     _ensure_pve_mod_directory_exists();
 
-    # Try to acquire startup lock FIRST (prevents race conditions)
+    # Try to get the lock
     _debug(__LINE__, "Trying to acquire startup lock: $startup_lock");
     my $startup_fh = _acquire_exclusive_lock($startup_lock, 'startup lock');
     return unless $startup_fh;
+    
+    # SECOND CHECK (after lock) - verify nothing changed while waiting
+    if (_is_pve_mod_worker_running()) {
+        _debug(__LINE__, "Worker started by another process while we waited for lock");
+        close($startup_fh);
+        unlink($startup_lock);
+        return "already running";
+    }
+    
+    # Now we KNOW we're the only one starting things
     print $startup_fh "$$\n";
-    close($startup_fh);
+    $startup_fh->flush();
     _debug(__LINE__, "Wrote PID, $$, to startup lock");
 
     # Start sensors collector first
@@ -1431,6 +1659,9 @@ sub _pve_mod_starter {
 
     # Start graphics collectors
     _start_graphics_collectors();
+
+    # Start UPS collector
+    _start_ups_collector();
 
     _debug(__LINE__, "All collectors started");
 
@@ -1443,10 +1674,6 @@ sub _pve_mod_starter {
     
     _debug(__LINE__, "pve_mod_worker started successfully, returning");
 }
-
-# ============================================================================
-# PVE Mod Worker
-# ============================================================================
 
 sub _pve_mod_worker {
     _debug(__LINE__, "_pve_mod_worker called");
@@ -1577,7 +1804,7 @@ sub _stop_collectors {
     
     # Read current PIDs from lock file
     my @pids;
-    if (open my $lock_fh, '<', $lock_file) {
+    if (open my $lock_fh, '<', $collectors_pid_file) {
         while (my $line = <$lock_fh>) {
             chomp $line;
             # Extract PID from "PID card type" format
@@ -1625,8 +1852,8 @@ sub _stop_collectors {
     if (-f $state_file) {
         unlink $state_file or _debug(__LINE__, "Failed to remove $state_file: $!");
     }
-    if (-f $lock_file) {
-        unlink $lock_file or _debug(__LINE__, "Failed to remove $lock_file: $!");
+    if (-f $collectors_pid_file) {
+        unlink $collectors_pid_file or _debug(__LINE__, "Failed to remove $collectors_pid_file: $!");
     }
     
     # Remove pve mod worker directory and all files if it exists
