@@ -44,12 +44,13 @@ my $state_file = "$pve_mod_working_dir/stats.json";
 my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
 my $ups_state_file = "$pve_mod_working_dir/ups.json";
 
-my $collectors_pid_file = "$pve_mod_working_dir/collectors.pids"; # List of collector PIDs
 my $pve_mod_worker_lock = "$pve_mod_working_dir/pve_mod_worker.lock"; # PVE Mod worker lock 
 my $startup_lock = "$pve_mod_working_dir/startup.lock";  # Exclusive startup lock
 my $last_snapshot = {};
 my $last_mtime = 0;
-my $is_collector_parent = 0;  # Flag to track if this process started collectors
+
+# Collector registry - only populated in worker process
+my %collectors = ();  # key: device/card name, value: PID
 my $last_get_graphic_stats_time = 0;  # Track when get_graphic_stats was last called
 my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic_stats call
 my $data_pull_interval = 1; # Interval in seconds between data pulls
@@ -463,74 +464,19 @@ sub _start_child_collector {
     
     if ($pid == 0) {
         # Child process
+        $process_type = 'collector';
         _debug(__LINE__, "In child process for $collector_name");
         $0 = "pve-mod-$collector_name";
         $collector_sub->($device);
         exit(0);
     }
     
-    # Parent process
+    # Parent process (worker only)
     _debug(__LINE__, "Forked child PID $pid for $collector_name");
     return $pid;
 }
 
-sub _write_collector_lock {
-    my ($lock_path, @collector_entries) = @_;
-    
-    my $lock_fh;
-    unless (open $lock_fh, '>', $lock_path) {
-        _debug(__LINE__, "Failed to open lock file for writing: $!");
-        return 0;
-    }
-    
-    foreach my $entry (@collector_entries) {
-        my ($pid, $name, $type) = @$entry;
-        # Quote the name to preserve spaces
-        print $lock_fh "$pid \"$name\" $type\n";
-    }
-    
-    close($lock_fh);
-    _debug(__LINE__, "Wrote " . scalar(@collector_entries) . " collector entries to lock file");
-    return 1;
-}
-
-sub _read_collector_lock {
-    my ($lock_path) = @_;
-    
-    my %collectors;
-    return %collectors unless -f $lock_path;
-    
-    if (open my $lock_fh, '<', $lock_path) {
-        while (my $line = <$lock_fh>) {
-            chomp $line;
-            # Match: PID "name with spaces" type
-            if ($line =~ /^(\d+)\s+"([^"]+)"\s+(\S+)/) {
-                $collectors{$2} = { pid => $1, type => $3 };
-            }
-        }
-        close($lock_fh);
-    }
-    
-    return %collectors;
-}
-
-sub _is_collector_running {
-    my ($collector_name, $lock_path) = @_;
-    
-    my %collectors = _read_collector_lock($lock_path);
-    
-    if (exists $collectors{$collector_name}) {
-        my $pid = $collectors{$collector_name}->{pid};
-        if (_is_process_alive($pid)) {
-            _debug(__LINE__, "Collector '$collector_name' already running with PID $pid");
-            return $pid;
-        } else {
-            _debug(__LINE__, "Collector '$collector_name' PID $pid is stale");
-        }
-    }
-    
-    return undef;
-}
+# Legacy PID file functions removed - worker now manages collectors directly via %collectors hash
 
 # ============================================================================
 # Temperature Sensors
@@ -1412,11 +1358,16 @@ sub _start_collector {
     
     _debug(__LINE__, "Starting $collector_type collector: $collector_name");
     
-    # Check if already running
-    my $existing_pid = _is_collector_running($collector_name, $collectors_pid_file);
-    if ($existing_pid) {
-        _debug(__LINE__, "$collector_type collector '$collector_name' already running with PID $existing_pid");
-        return $existing_pid;
+    # Check if already running (in worker's hash)
+    if (exists $collectors{$collector_name}) {
+        my $pid = $collectors{$collector_name};
+        if (kill(0, $pid)) {
+            _debug(__LINE__, "$collector_type collector '$collector_name' already running with PID $pid");
+            return $pid;
+        } else {
+            _debug(__LINE__, "Collector '$collector_name' PID $pid is stale, removing from registry");
+            delete $collectors{$collector_name};
+        }
     }
     
     # Start the collector
@@ -1427,22 +1378,9 @@ sub _start_collector {
         return undef;
     }
     
-    # Read existing entries from lock file
-    my @collector_entries;
-    my %existing = _read_collector_lock($collectors_pid_file);
-    foreach my $name (keys %existing) {
-        push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
-    }
-    
-    # Add new collector entry
-    push @collector_entries, [$pid, $collector_name, $collector_type];
-    
-    # Write updated lock file
-    unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
-        _debug(__LINE__, "Failed to update lock file, terminating $collector_type collector");
-        kill 'TERM', $pid;
-        return undef;
-    }
+    # Register in worker's hash
+    $collectors{$collector_name} = $pid;
+    _debug(__LINE__, "Registered $collector_type collector '$collector_name' with PID $pid");
     
     # Verify it's alive
     sleep 0.1;
@@ -1451,6 +1389,7 @@ sub _start_collector {
         return $pid;
     } else {
         _debug(__LINE__, "WARNING - $collector_type collector '$collector_name' (PID $pid) died immediately!");
+        delete $collectors{$collector_name};
         return undef;
     }
 }
@@ -1603,18 +1542,7 @@ sub _pve_mod_starter {
     $startup_fh->flush();
     _debug(__LINE__, "Wrote PID, $$, to startup lock");
 
-    # Start sensors collector first
-    _start_sensors_collector();
-
-    # Start graphics collectors
-    _start_graphics_collectors();
-
-    # Start UPS collector
-    _start_ups_collector();
-
-    _debug(__LINE__, "All collectors started");
-
-    # Start pve mod worker
+    # Start pve mod worker (which will start all collectors)
     _pve_mod_worker();
 
     # Remove startup lock LAST
@@ -1708,16 +1636,43 @@ sub _pve_mod_keep_alive {
         $last_activity = time();
         _debug(__LINE__, "Activity ping received");
     };
+    
+    # SIGCHLD handler to prevent zombies and clean up collector registry
+    $SIG{CHLD} = sub {
+        while ((my $pid = waitpid(-1, WNOHANG)) > 0) {
+            my $exit_status = $? >> 8;
+            _debug(__LINE__, "Child process $pid exited with status $exit_status");
+            
+            # Find and remove from collector registry
+            foreach my $name (keys %collectors) {
+                if ($collectors{$name} == $pid) {
+                    _debug(__LINE__, "Collector '$name' (PID $pid) exited, removing from registry");
+                    delete $collectors{$name};
+                    last;
+                }
+            }
+        }
+    };
+    
     $SIG{TERM} = sub {
         _debug(__LINE__, "pve_mod_worker received SIGTERM, shutting down");
+        _stop_collectors();
         unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
     $SIG{INT} = sub {
         _debug(__LINE__, "pve_mod_worker received SIGINT, shutting down");
+        _stop_collectors();
         unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
+    
+    # Worker now starts all collectors (moved from _pve_mod_starter)
+    _debug(__LINE__, "Worker starting all collectors");
+    _start_sensors_collector();
+    _start_graphics_collectors();
+    _start_ups_collector();
+    _debug(__LINE__, "All collectors started by worker");
     
     _debug(__LINE__, "Entering pve_mod_worker loop, timeout=${COLLECTOR_TIMEOUT}s");
     
@@ -1753,37 +1708,25 @@ sub _is_pve_mod_worker_running {
 sub _stop_collectors {
     _debug(__LINE__, "Stopping all collectors");
     
-    # Read current PIDs from lock file
-    my @pids;
-    if (open my $lock_fh, '<', $collectors_pid_file) {
-        while (my $line = <$lock_fh>) {
-            chomp $line;
-            # Extract PID from "PID card type" format
-            if ($line =~ /^(\d+)/) {
-                push @pids, $1;
-            }
-        }
-        close($lock_fh);
-    }
-    _debug(__LINE__, "Cleanup complete_1");
-
+    # Get PIDs from worker's collector registry
+    my @pids = values %collectors;
+    
     if (@pids) {
         _debug(__LINE__, "Sending SIGTERM to " . scalar(@pids) . " collector process(es)");
         foreach my $pid (@pids) {
-            kill('TERM', $pid) if kill(0, $pid);
+            if (kill(0, $pid)) {
+                kill('TERM', $pid);
+                _debug(__LINE__, "Sent SIGTERM to collector PID $pid");
+            }
         }
         
-        _debug(__LINE__, "Cleanup complete_2");
-
-        # Wait up to 5 seconds for graceful shutdown
-        my $timeout = 30;
+        # Wait up to 2 seconds for graceful shutdown
+        my $timeout = 2;
         my $start = time();
         while (time() - $start < $timeout) {
             my $any_alive = 0;
             foreach my $pid (@pids) {
-                _debug(__LINE__, "Checking if collector process $pid is still alive");
                 if (kill(0, $pid)) {
-                    _debug(__LINE__, "Collector process $pid is still alive");
                     $any_alive = 1;
                     last;
                 }
@@ -1791,7 +1734,7 @@ sub _stop_collectors {
             last unless $any_alive;
             select(undef, undef, undef, 0.1);
         }
-        _debug(__LINE__, "Cleanup complete_3");
+        
         # Force kill any survivors
         foreach my $pid (@pids) {
             if (kill(0, $pid)) {
@@ -1799,14 +1742,15 @@ sub _stop_collectors {
                 kill('KILL', $pid);
             }
         }
-        _debug(__LINE__, "Cleanup complete_4");
     }
     
+    # Clear collector registry
+    %collectors = ();
+    _debug(__LINE__, "Cleared collector registry");
+    
+    # Remove state files
     if (-f $state_file) {
         unlink $state_file or _debug(__LINE__, "Failed to remove $state_file: $!");
-    }
-    if (-f $collectors_pid_file) {
-        unlink $collectors_pid_file or _debug(__LINE__, "Failed to remove $collectors_pid_file: $!");
     }
     
     # Remove pve mod worker directory and all files if it exists
@@ -1815,7 +1759,7 @@ sub _stop_collectors {
         _debug(__LINE__, "Cleanup errors: @$err") if @$err;
     }
 
-    _debug(__LINE__, "Cleanup complete_5");
+    _debug(__LINE__, "Cleanup complete");
 }
 
 END { 
