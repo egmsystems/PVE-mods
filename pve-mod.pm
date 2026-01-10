@@ -995,32 +995,26 @@ sub _get_ups_status {
     my ($ups_name) = @_;
 
     # upsc upsname[@hostname[:port]]
-    my $cmd = "upsc $ups_name 2>/dev/null";
-    
-    _debug(__LINE__, "Running command: $cmd");
+    _debug(__LINE__, "Collecting UPS status for $ups_name");
     
     # Execute command and capture output
-    my $output = `$cmd`;
-
-    _debug(__LINE__, "upsc command output collected");
-
-    my $exit_code = $? >> 8;
+    my $output = `/usr/bin/upsc $ups_name 2>/dev/null`;
     
-    _debug(__LINE__, "upsc command exited with code $exit_code");
-
-    if ($exit_code != 0) {
-        _debug(__LINE__, "upsc command failed with exit code $exit_code");
-        return encode_json({ error => "Failed to execute upsc for $ups_name" });
+    unless (defined $output) {
+        _debug(__LINE__, "Failed to execute upsc");
+        return encode_json({ error => "Failed to execute upsc" });
     }
-    
-    _debug(__LINE__, "upsc command executed successfully");
+
+    # Check if we got any output
+    unless (defined $output && length($output) > 0) {
+        _debug(__LINE__, "No output from upsc for $ups_name");
+        return encode_json({ error => "No data from UPS $ups_name" });
+    }
 
     # Convert upsc output to nested hash structure
     my $ups_data = _parse_upsc_output($output);
-
-    _debug(__LINE__, "Parsed upsc output for $ups_name");
     
-    # Check if we got any data
+    # Check if we got any parsed data
     unless (keys %$ups_data) {
         _debug(__LINE__, "No data received from upsc for $ups_name");
         return encode_json({ error => "No data from UPS $ups_name" });
@@ -1030,8 +1024,6 @@ sub _get_ups_status {
     my $result = {
         $ups_name => $ups_data
     };
-    
-    _debug(__LINE__, "Successfully parsed UPS data for $ups_name");
     
     # Return as pretty JSON
     return JSON->new->pretty->canonical->encode($result);
@@ -1495,6 +1487,12 @@ sub _start_ups_collector {
     }
 
     _debug(__LINE__, "Starting UPS collector");
+    
+    # Check if upsc is available
+    unless (-x '/usr/bin/upsc') {
+        _debug(__LINE__, "upsc not available, skipping UPS collector startup");
+        return;
+    }
     
     # Check if UPS is configured
     unless (defined $ups_device && $ups_device->{ups_name}) {
