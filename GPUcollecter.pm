@@ -52,6 +52,7 @@ my $last_mtime = 0;
 my $is_collector_parent = 0;  # Flag to track if this process started collectors
 my $last_get_graphic_stats_time = 0;  # Track when get_graphic_stats was last called
 my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic_stats call
+my $data_pull_interval = 1; # Interval in seconds between data pulls
 
 my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
 my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
@@ -200,7 +201,8 @@ sub _collector_for_intel_device {
     
     # Run intel_gpu_top once and keep reading from it
     _debug(__LINE__, "About to open pipe to intel_gpu_top");
-    $intel_gpu_top_pid = open(my $fh, '-|', "intel_gpu_top -d $drm_dev -s 1000 -l 2>&1");
+    my $intel_pull_interval = $data_pull_interval * 1000; # in milliseconds
+    $intel_gpu_top_pid = open(my $fh, '-|', "intel_gpu_top -d $drm_dev -s $intel_pull_interval -l 2>&1");
     
     unless (defined $intel_gpu_top_pid && $intel_gpu_top_pid > 0) {
         _debug(__LINE__, "Failed to run intel_gpu_top for $drm_dev: $!");
@@ -430,7 +432,7 @@ sub collector_for_nvidia_device {
     # TODO: Implement actual NVIDIA monitoring
     while (!$shutdown) {
         _debug(__LINE__, "NVIDIA collector running (stub)");
-        sleep 1;
+        sleep $data_pull_interval;
     }
     
     _debug(__LINE__, "NVIDIA collector shutting down");
@@ -567,7 +569,7 @@ sub _collector_for_temperature_sensors {
             _debug(__LINE__, "Error writing temperature sensor data: $@");
         }
 
-        sleep 1 unless $shutdown;
+        sleep $data_pull_interval unless $shutdown;
     }
 
     _debug(__LINE__, "Temperature sensor collector shutting down");
@@ -1029,7 +1031,7 @@ sub _collector_for_ups {
             _debug(__LINE__, "Error writing ups data: $@");
         }
 
-        sleep 1 unless $shutdown;
+        sleep $data_pull_interval unless $shutdown;
     }
     _debug(__LINE__, "UPS collector shutting down");
     exit 0;
