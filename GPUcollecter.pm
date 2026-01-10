@@ -1399,6 +1399,54 @@ sub get_ups_stats {
 # Main Collector
 # ============================================================================
 
+sub _start_collector {
+    my ($collector_name, $collector_type, $collector_sub, $device) = @_;
+    
+    _debug(__LINE__, "Starting $collector_type collector: $collector_name");
+    
+    # Check if already running
+    my $existing_pid = _is_collector_running($collector_name, $collectors_pid_file);
+    if ($existing_pid) {
+        _debug(__LINE__, "$collector_type collector '$collector_name' already running with PID $existing_pid");
+        return $existing_pid;
+    }
+    
+    # Start the collector
+    my $pid = _start_child_collector($collector_name, $collector_sub, $device);
+    
+    unless ($pid) {
+        _debug(__LINE__, "Failed to start $collector_type collector '$collector_name'");
+        return undef;
+    }
+    
+    # Read existing entries from lock file
+    my @collector_entries;
+    my %existing = _read_collector_lock($collectors_pid_file);
+    foreach my $name (keys %existing) {
+        push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
+    }
+    
+    # Add new collector entry
+    push @collector_entries, [$pid, $collector_name, $collector_type];
+    
+    # Write updated lock file
+    unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
+        _debug(__LINE__, "Failed to update lock file, terminating $collector_type collector");
+        kill 'TERM', $pid;
+        return undef;
+    }
+    
+    # Verify it's alive
+    sleep 0.1;
+    if (kill(0, $pid)) {
+        _debug(__LINE__, "Verified $collector_type collector '$collector_name' (PID $pid) is alive");
+        return $pid;
+    } else {
+        _debug(__LINE__, "WARNING - $collector_type collector '$collector_name' (PID $pid) died immediately!");
+        return undef;
+    }
+}
+
 sub _start_graphics_collectors {
 
     if ($intel_gpu_enabled == 0 && $amd_gpu_enabled == 0 && $nvidia_gpu_enabled == 0) {
@@ -1408,9 +1456,6 @@ sub _start_graphics_collectors {
     else {
         _debug(__LINE__, "Starting graphics collectors");
     }
-
-    # Read existing collectors from lock file
-    my %existing_collectors = _read_collector_lock($collectors_pid_file);
     
     # Generalized device collector management for future AMD/NVIDIA support
     my @all_devices;
@@ -1467,59 +1512,19 @@ sub _start_graphics_collectors {
 
     _debug(__LINE__, "Finished detecting devices. Total collectors to manage: " . scalar(@all_devices));
 
-    my @collector_entries;
-    
+    # Start each graphics collector using unified function
+    my $started_count = 0;
     for (my $i = 0; $i < @all_devices; $i++) {
         my $device = $all_devices[$i];
         my $type = $all_types[$i];
         my $collector_sub = $all_collector_subs[$i];
         my $device_name = $device->{card} // $device->{name} // "device$i";
         
-        # Check if collector already running
-        my $existing_pid = _is_collector_running($device_name, $collectors_pid_file);
-        if ($existing_pid) {
-            _debug(__LINE__, "Collector for $type $device_name already running with PID $existing_pid");
-            push @collector_entries, [$existing_pid, $device_name, $type];
-            next;
-        }
-        
-        # Start new collector
-        my $pid = _start_child_collector($device_name, $collector_sub, $device);
-        if ($pid) {
-            push @collector_entries, [$pid, $device_name, $type];
-        }
-    }
-    
-    # Write all collector PIDs to lock file
-    unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
-        _debug(__LINE__, "Failed to write lock file, terminating collectors");
-        foreach my $entry (@collector_entries) {
-            kill 'TERM', $entry->[0];
-        }
-        return;
-    }
-    
-    # Wait briefly to ensure collectors are running
-    sleep 0.1;
-
-    # Verify collectors are alive
-    my $any_alive = 0;
-    foreach my $entry (@collector_entries) {
-        my ($pid, $name, $type) = @$entry;
-        if (kill(0, $pid)) {
-            $any_alive = 1;
-            _debug(__LINE__, "Verified $type collector $name (PID $pid) is alive");
-        } else {
-            _debug(__LINE__, "WARNING - $type collector $name (PID $pid) died immediately!");
-        }
-    }
-    
-    unless ($any_alive) {
-        _debug(__LINE__, "ERROR - No collectors alive after fork!");
-        return;
+        my $pid = _start_collector($device_name, $type, $collector_sub, $device);
+        $started_count++ if $pid;
     }
 
-    _debug(__LINE__, "All graphics collectors started successfully");
+    _debug(__LINE__, "Started/verified $started_count graphics collector(s)");
 }
 
 sub _start_sensors_collector {
@@ -1531,42 +1536,8 @@ sub _start_sensors_collector {
         return;
     }
     
-    # Check if already running
-    my $existing_pid = _is_collector_running('sensors', $collectors_pid_file);
-    if ($existing_pid) {
-        _debug(__LINE__, "Sensors collector already running with PID $existing_pid");
-        return;
-    }
-    
-    # Start the collector
-    my $pid = _start_child_collector('sensors', \&_collector_for_temperature_sensors, { name => 'sensors' });
-    
-    if ($pid) {
-        # Read existing entries
-        my @collector_entries;
-        my %existing = _read_collector_lock($collectors_pid_file);
-        foreach my $name (keys %existing) {
-            push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
-        }
-        
-        # Add sensors entry
-        push @collector_entries, [$pid, 'sensors', 'sensors'];
-        
-        # Write updated lock file
-        unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
-            _debug(__LINE__, "Failed to update lock file, terminating sensors collector");
-            kill 'TERM', $pid;
-            return;
-        }
-        
-        # Verify it's alive
-        sleep 0.1;
-        if (kill(0, $pid)) {
-            _debug(__LINE__, "Verified sensors collector (PID $pid) is alive");
-        } else {
-            _debug(__LINE__, "WARNING - Sensors collector (PID $pid) died immediately!");
-        }
-    }
+    # Use unified collector startup
+    _start_collector('sensors', 'sensors', \&_collector_for_temperature_sensors, { name => 'sensors' });
 }
 
 sub _start_ups_collector {
@@ -1584,42 +1555,8 @@ sub _start_ups_collector {
         return;
     }
     
-    # Check if already running
-    my $existing_pid = _is_collector_running('ups', $collectors_pid_file);
-    if ($existing_pid) {
-        _debug(__LINE__, "UPS collector already running with PID $existing_pid");
-        return;
-    }
-    
-    # Start the collector
-    my $pid = _start_child_collector('ups', \&_collector_for_ups, $ups_device);
-    
-    if ($pid) {
-        # Read existing entries
-        my @collector_entries;
-        my %existing = _read_collector_lock($collectors_pid_file);
-        foreach my $name (keys %existing) {
-            push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
-        }
-        
-        # Add UPS entry
-        push @collector_entries, [$pid, 'ups', 'ups'];
-        
-        # Write updated lock file
-        unless (_write_collector_lock($collectors_pid_file, @collector_entries)) {
-            _debug(__LINE__, "Failed to update lock file, terminating UPS collector");
-            kill 'TERM', $pid;
-            return;
-        }
-        
-        # Verify it's alive
-        sleep 0.1;
-        if (kill(0, $pid)) {
-            _debug(__LINE__, "Verified UPS collector (PID $pid) is alive");
-        } else {
-            _debug(__LINE__, "WARNING - UPS collector (PID $pid) died immediately!");
-        }
-    }
+    # Use unified collector startup
+    _start_collector('ups', 'ups', \&_collector_for_ups, $ups_device);
 }
 
 # ============================================================================
