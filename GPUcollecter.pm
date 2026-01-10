@@ -45,7 +45,7 @@ my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
 my $ups_state_file = "$pve_mod_working_dir/ups.json";
 
 my $collectors_pid_file = "$pve_mod_working_dir/collectors.pids"; # List of collector PIDs
-my $pve_mod_worker_lock = "$pve_mod_working_dir/pve-mod-pve_mod_worker.lock"; # PVE Mod worker lock 
+my $pve_mod_worker_lock = "$pve_mod_working_dir/pve_mod_worker.lock"; # PVE Mod worker lock 
 my $startup_lock = "$pve_mod_working_dir/startup.lock";  # Exclusive startup lock
 my $last_snapshot = {};
 my $last_mtime = 0;
@@ -1694,6 +1694,7 @@ sub _pve_mod_worker {
     
     if ($pve_mod_worker_pid == 0) {
         # Child process - run the pve_mod_worker
+        $0 = "pve_mod_worker_controller";
         _debug(__LINE__, "Child process forked, calling _pve_mod_keep_alive");
         _pve_mod_keep_alive();
         exit(0);  # Should never reach here
