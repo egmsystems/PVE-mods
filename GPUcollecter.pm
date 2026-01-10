@@ -413,7 +413,7 @@ sub parse_nvidia_gpu_line {
 sub collector_for_nvidia_device {
     my ($device) = @_;
     
-    $0 = "pve-mod-gpu-nvidia-collector";
+    $0 = "pve-mod-gpu-nvidia-collector: $device->{index}";
     _debug(__LINE__, "NVIDIA collector started (stub implementation)");
     
     # Set up signal handlers for graceful shutdown
@@ -476,7 +476,8 @@ sub _write_collector_lock {
     
     foreach my $entry (@collector_entries) {
         my ($pid, $name, $type) = @$entry;
-        print $lock_fh "$pid $name $type\n";
+        # Quote the name to preserve spaces
+        print $lock_fh "$pid \"$name\" $type\n";
     }
     
     close($lock_fh);
@@ -493,7 +494,8 @@ sub _read_collector_lock {
     if (open my $lock_fh, '<', $lock_path) {
         while (my $line = <$lock_fh>) {
             chomp $line;
-            if ($line =~ /^(\d+)\s+(\S+)\s+(\S+)/) {
+            # Match: PID "name with spaces" type
+            if ($line =~ /^(\d+)\s+"([^"]+)"\s+(\S+)/) {
                 $collectors{$2} = { pid => $1, type => $3 };
             }
         }
