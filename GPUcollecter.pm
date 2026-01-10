@@ -183,7 +183,7 @@ sub _get_intel_gpu_devices {
 sub _collector_for_intel_device {
     my ($device) = @_;
     $process_type = 'collector';
-    $0 = "pve-mod-gpu-intel-collector: $device->{card}";
+    $0 = "collector-gpu-intel-$device->{card}";
 
     my $drm_dev = "drm:/dev/dri/$device->{card}";
     my $intel_gpu_top_pid = undef;
@@ -423,7 +423,7 @@ sub collector_for_nvidia_device {
     my ($device) = @_;
     $process_type = 'collector';
     
-    $0 = "pve-mod-gpu-nvidia-collector: $device->{index}";
+    $0 = "collector-gpu-nvidia-$device->{index}";
     _debug(__LINE__, "NVIDIA collector started (stub implementation)");
     
     # Set up signal handlers for graceful shutdown
@@ -466,7 +466,7 @@ sub _start_child_collector {
         # Child process
         $process_type = 'collector';
         _debug(__LINE__, "In child process for $collector_name");
-        $0 = "pve-mod-$collector_name";
+        $0 = "collector-$collector_name";
         $collector_sub->($device);
         exit(0);
     }
@@ -485,7 +485,7 @@ sub _start_child_collector {
 sub _collector_for_temperature_sensors {
     my ($device) = @_;
     $process_type = 'collector';
-    $0 = "pve-mod-sensors-collector";
+    $0 = "collector-temperature-sensors";
 
     _debug(__LINE__, "Temperature sensor collector started");
 
@@ -958,7 +958,7 @@ sub _cpu_model_by_package {
 sub _collector_for_ups {
     my ($device) = @_;
     $process_type = 'collector';
-    $0 = "pve-mod-ups-collector";
+    $0 = "collector-ups-$device->{ups_name}";
     _debug(__LINE__, "UPS collector started");
     
     # Set up signal handlers for graceful shutdown
