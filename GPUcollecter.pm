@@ -67,6 +67,11 @@ my $ups_device = {
 };
 
 # ============================================================================
+# Code starts here
+# ============================================================================
+my $process_type = 'main';  # 'main', 'worker', or 'collector'
+
+# ============================================================================
 # Intel GPU Support
 # ============================================================================
 
@@ -176,6 +181,7 @@ sub _get_intel_gpu_devices {
 
 sub _collector_for_intel_device {
     my ($device) = @_;
+    $process_type = 'collector';
     $0 = "pve-mod-gpu-intel-collector: $device->{card}";
 
     my $drm_dev = "drm:/dev/dri/$device->{card}";
@@ -414,6 +420,7 @@ sub parse_nvidia_gpu_line {
 
 sub collector_for_nvidia_device {
     my ($device) = @_;
+    $process_type = 'collector';
     
     $0 = "pve-mod-gpu-nvidia-collector: $device->{index}";
     _debug(__LINE__, "NVIDIA collector started (stub implementation)");
@@ -531,8 +538,9 @@ sub _is_collector_running {
 
 sub _collector_for_temperature_sensors {
     my ($device) = @_;
-    
+    $process_type = 'collector';
     $0 = "pve-mod-sensors-collector";
+
     _debug(__LINE__, "Temperature sensor collector started");
 
     # return if lm-sensors is not installed
@@ -1003,7 +1011,7 @@ sub _cpu_model_by_package {
 
 sub _collector_for_ups {
     my ($device) = @_;
-    
+    $process_type = 'collector';
     $0 = "pve-mod-ups-collector";
     _debug(__LINE__, "UPS collector started");
     
@@ -1690,6 +1698,7 @@ sub _notify_pve_mod_worker {
 }
 
 sub _pve_mod_keep_alive {
+    $process_type = 'worker';
     _debug(__LINE__, "pve_mod_worker process started with PID $$");
     
     my $last_activity = time();
@@ -1767,12 +1776,14 @@ sub _stop_collectors {
         _debug(__LINE__, "Cleanup complete_2");
 
         # Wait up to 5 seconds for graceful shutdown
-        my $timeout = 5;
+        my $timeout = 30;
         my $start = time();
         while (time() - $start < $timeout) {
             my $any_alive = 0;
             foreach my $pid (@pids) {
+                _debug(__LINE__, "Checking if collector process $pid is still alive");
                 if (kill(0, $pid)) {
+                    _debug(__LINE__, "Collector process $pid is still alive");
                     $any_alive = 1;
                     last;
                 }
@@ -1807,6 +1818,17 @@ sub _stop_collectors {
     _debug(__LINE__, "Cleanup complete_5");
 }
 
-END { _stop_collectors() }
+END { 
+    if ($process_type eq 'worker') {
+        _debug(__LINE__, "PVE Mod Worker END block: cleaning up");
+        _stop_collectors();
+    } elsif ($process_type eq 'collector') {
+        _debug(__LINE__, "Collector ($0) END block: no cleanup needed");
+        # Collectors just exit, no cleanup needed
+    } else {
+        _debug(__LINE__, "Main process END block: no cleanup needed");
+        # Main pveproxy process doesn't cleanup
+    }
+}
 
 1;
