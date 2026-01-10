@@ -41,6 +41,7 @@ sub _debug {
 my $pve_mod_working_dir = '/run/pveproxy/pve-mod';
 my $stats_dir = $pve_mod_working_dir;
 my $state_file = "$pve_mod_working_dir/stats.json";
+my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
 my $lock_file = "$pve_mod_working_dir/pve-mod-worker.lock";
 my $pve_mod_worker_lock = "$pve_mod_working_dir/pve-mod-pve_mod_worker.lock";
 my $startup_lock = $lock_file . ".startup";
@@ -246,6 +247,16 @@ sub _collector_for_intel_device {
     exit 0;
 }
 
+# Parse information for graphical presentation. 
+sub _parse_graphic_info {
+    my ($line) = @_;
+
+    # Create an intel file with 
+    # Timestamp Device index, name, Render/3D, Blitter, Video, VideoEnhance, power consumption
+
+    return undef;
+}
+
 # ============================================================================
 # AMD GPU Support (Placeholder)
 # ============================================================================
@@ -393,7 +404,585 @@ sub parse_nvidia_gpu_line {
 
 sub collector_for_nvidia_device {
     my ($device) = @_;
-    # nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed --format=csv,nounits,noheader --loop=1
+    
+    $0 = "pve-mod-gpu-nvidia-collector";
+    _debug(__LINE__, "NVIDIA collector started (stub implementation)");
+    
+    # Set up signal handlers for graceful shutdown
+    my $shutdown = 0;
+    $SIG{TERM} = sub {
+        _debug(__LINE__, "NVIDIA collector received SIGTERM");
+        $shutdown = 1;
+    };
+    $SIG{INT} = sub {
+        _debug(__LINE__, "NVIDIA collector received SIGINT");
+        $shutdown = 1;
+    };
+    
+    # TODO: Implement actual NVIDIA monitoring
+    while (!$shutdown) {
+        _debug(__LINE__, "NVIDIA collector running (stub)");
+        sleep 1;
+    }
+    
+    _debug(__LINE__, "NVIDIA collector shutting down");
+    exit 0;
+}
+
+# ============================================================================
+# Unified Child Process Management
+# ============================================================================
+
+sub _start_child_collector {
+    my ($collector_name, $collector_sub, $device) = @_;
+    
+    _debug(__LINE__, "Starting child collector: $collector_name");
+    
+    my $pid = fork();
+    unless (defined $pid) {
+        _debug(__LINE__, "fork failed for $collector_name: $!");
+        return undef;
+    }
+    
+    if ($pid == 0) {
+        # Child process
+        _debug(__LINE__, "In child process for $collector_name");
+        $0 = "pve-mod-$collector_name";
+        $collector_sub->($device);
+        exit(0);
+    }
+    
+    # Parent process
+    _debug(__LINE__, "Forked child PID $pid for $collector_name");
+    return $pid;
+}
+
+sub _write_collector_lock {
+    my ($lock_path, @collector_entries) = @_;
+    
+    my $lock_fh;
+    unless (open $lock_fh, '>', $lock_path) {
+        _debug(__LINE__, "Failed to open lock file for writing: $!");
+        return 0;
+    }
+    
+    foreach my $entry (@collector_entries) {
+        my ($pid, $name, $type) = @$entry;
+        print $lock_fh "$pid $name $type\n";
+    }
+    
+    close($lock_fh);
+    _debug(__LINE__, "Wrote " . scalar(@collector_entries) . " collector entries to lock file");
+    return 1;
+}
+
+sub _read_collector_lock {
+    my ($lock_path) = @_;
+    
+    my %collectors;
+    return %collectors unless -f $lock_path;
+    
+    if (open my $lock_fh, '<', $lock_path) {
+        while (my $line = <$lock_fh>) {
+            chomp $line;
+            if ($line =~ /^(\d+)\s+(\S+)\s+(\S+)/) {
+                $collectors{$2} = { pid => $1, type => $3 };
+            }
+        }
+        close($lock_fh);
+    }
+    
+    return %collectors;
+}
+
+sub _is_collector_running {
+    my ($collector_name, $lock_path) = @_;
+    
+    my %collectors = _read_collector_lock($lock_path);
+    
+    if (exists $collectors{$collector_name}) {
+        my $pid = $collectors{$collector_name}->{pid};
+        if (_is_process_alive($pid)) {
+            _debug(__LINE__, "Collector '$collector_name' already running with PID $pid");
+            return $pid;
+        } else {
+            _debug(__LINE__, "Collector '$collector_name' PID $pid is stale");
+        }
+    }
+    
+    return undef;
+}
+
+# ============================================================================
+# Temperature Sensors
+# ============================================================================
+
+sub _collector_for_temperature_sensors {
+    my ($device) = @_;
+    
+    $0 = "pve-mod-sensors-collector";
+    _debug(__LINE__, "Temperature sensor collector started");
+
+    # return if lm-sensors is not installed
+    unless (-x '/usr/bin/sensors') {
+        _debug(__LINE__, "sensors not available, exiting");
+        exit(1);
+    }
+
+    # Cache for drive and CPU names
+    my %cache_ref;
+
+    # Set up signal handlers for graceful shutdown
+    my $shutdown = 0;
+    $SIG{TERM} = sub {
+        _debug(__LINE__, "Temperature sensor collector received SIGTERM");
+        $shutdown = 1;
+    };
+    $SIG{INT} = sub {
+        _debug(__LINE__, "Temperature sensor collector received SIGINT");
+        $shutdown = 1;
+    };
+
+    while (!$shutdown) {
+        my $sensorsData = _get_temperature_sensors(\%cache_ref);
+
+        # Write to sensors state file
+        eval {
+            open my $ofh, '>', $sensors_state_file or die "Failed to open $sensors_state_file: $!";
+            print $ofh $sensorsData;
+            close $ofh;
+            _debug(__LINE__, "Wrote temperature sensor data to $sensors_state_file");
+        };
+        if ($@) {
+            _debug(__LINE__, "Error writing temperature sensor data: $@");
+        }
+
+        sleep 1 unless $shutdown;
+    }
+
+    _debug(__LINE__, "Temperature sensor collector shutting down");
+    exit 0;
+}
+
+sub _get_temperature_sensors {
+    my ($cache_ref) = @_;
+    
+    my $sensorsOutput;
+
+    # Collect sensor data from lm-sensors
+    $sensorsOutput = `sensors -j 2>/dev/null | python3 -m json.tool`;
+    
+    _debug(__LINE__, "Raw sensors output collected");
+
+    # sanitize output
+    my $sensorsData = _sanitize_sensors($sensorsOutput);
+
+    _debug(__LINE__, "Sanitized sensors output");
+
+    # translate drive names (pass cache reference)
+    $sensorsData = _get_drive_names($sensorsData, $cache_ref);
+
+    _debug(__LINE__, "Translated drive names in sensors output");
+
+    # translate CPU names (pass cache reference)
+    $sensorsData = _get_cpu_name($sensorsData, $cache_ref);  
+
+    _debug(__LINE__, "Translated CPU names in sensors output");  
+
+    # Good, now add a master node called lm sensors exhanced by PVE MOD
+    my $sensors_json;
+    eval {
+        $sensors_json = decode_json($sensorsData);
+    };
+    if ($@) {
+        _debug(__LINE__, "Failed to parse final sensors JSON: $@");
+        return $sensorsData;  # Return original output on parse error
+    }
+    my $enhanced_data = {
+        "PVE MOD lm-sensors Enhanced" => $sensors_json
+    };
+    $sensorsData = JSON->new->pretty->encode($enhanced_data);
+
+    
+
+    return $sensorsData;
+}
+
+sub _sanitize_sensors {
+    my ($sensorsOutput) = @_;
+
+    # Sanitize JSON output to handle common lm-sensors parsing issues
+    # Replace ERROR lines with placeholder values
+    $sensorsOutput =~ s/ERROR:.+\s(\w+):\s(.+)/\"$1\": 0.000,/g;
+    $sensorsOutput =~ s/ERROR:.+\s(\w+)!/\"$1\": 0.000,/g;
+    
+    # Remove trailing commas before closing braces
+    $sensorsOutput =~ s/,\s*(})/$1/g;
+    
+    # Replace NaN values with null for valid JSON
+    $sensorsOutput =~ s/\bNaN\b/null/g;
+    
+    # Fix duplicate SODIMM keys by appending temperature sensor number
+    # This prevents JSON key overwrites when multiple SODIMM sensors exist
+    # Example: "SODIMM":{"temp3_input":34.0} becomes "SODIMM3":{"temp3_input":34.0}
+    $sensorsOutput =~ s/\"SODIMM\":\{\"temp(\d+)_input\"/\"SODIMM$1\":\{\"temp$1_input\"/g;
+
+    return $sensorsOutput;
+}
+
+sub _get_drive_names {
+    my ($sensorsOutput, $cache_ref) = @_;
+    
+    # Use empty hash if no cache reference provided (shouldn't happen)
+    $cache_ref //= {};
+    
+    my @drive_names;
+    
+    # Parse sensors output to extract drive entries
+    my $sensors_data;
+    eval {
+        $sensors_data = decode_json($sensorsOutput);
+    };
+    if ($@) {
+        _debug(__LINE__, "Failed to parse sensors JSON: $@");
+        return $sensorsOutput;  # Return original output on parse error
+    }
+    
+    # Extract drive entries from sensors data
+    my @entries = grep { 
+        /^drivetemp-scsi-/ || /^drivetemp-nvme-/ || /^nvme-pci-/ 
+    } keys %{$sensors_data};
+    
+    _debug(__LINE__, "Found " . scalar(@entries) . " drive entries in sensors output");
+
+    foreach my $entry (@entries) {
+        my ($dev_path, $model, $serial) = ("unknown", "unknown", "unknown");
+        
+        # Check cache first
+        if (exists $cache_ref->{$entry}) {
+            my $cached = $cache_ref->{$entry};
+            $dev_path = $cached->{device_path};
+            $model = $cached->{model};
+            $serial = $cached->{serial};
+            _debug(__LINE__, "Using cached drive info for $entry");
+        } else {
+            # Lookup drive information
+            
+            # ----- SCSI/SATA -----
+            if ($entry =~ /^drivetemp-scsi-(\d+)-(\d+)/) {
+                my ($host, $id) = ($1, $2);
+                my $scsi_path = "/sys/class/scsi_disk/$host:$id:0:0/device/block";
+
+                if (opendir(my $sdh, $scsi_path)) {
+                    my @devs = grep { /^sd/ } readdir($sdh);
+                    closedir($sdh);
+                    if (@devs) {
+                        $dev_path = "/dev/$devs[0]";
+                        $model  = read_sysfs("/sys/class/block/$devs[0]/device/model");
+                        $serial = read_sysfs("/sys/class/block/$devs[0]/device/serial");
+                    }
+                }
+
+            # ----- Numeric NVMe -----
+            } elsif ($entry =~ /^drivetemp-nvme-(\d+)/) {
+                my $nvme_index = $1;
+                $dev_path = "/dev/nvme${nvme_index}n1";
+                if (-e $dev_path) {
+                    $model  = read_sysfs("/sys/class/block/nvme${nvme_index}n1/device/model");
+                    $serial = read_sysfs("/sys/class/block/nvme${nvme_index}n1/device/serial");
+                }
+
+            # ----- PCI-style NVMe -----
+            } elsif ($entry =~ /^nvme-pci-(\w+)/) {
+                my $pci_addr = $1;
+                
+                # Convert short PCI address to pattern
+                # nvme-pci-0600 -> 0000:06:00
+                # Format: domain:bus:device (function is usually .0)
+                my $pci_pattern;
+                if ($pci_addr =~ /^([0-9a-f]{2})([0-9a-f]{2})$/i) {
+                    # Short format like "0600" -> "06:00"
+                    my ($bus, $dev) = ($1, $2);
+                    $pci_pattern = sprintf("%04x:%02x:%02x", 0, hex($bus), hex($dev));
+                    _debug(__LINE__, "Converted PCI address $pci_addr to pattern $pci_pattern");
+                } else {
+                    # Already in some other format, use as-is
+                    $pci_pattern = $pci_addr;
+                }
+                
+                # Try multiple approaches to find the NVMe device
+                my $found = 0;
+                
+                # Approach 1: Check /sys/class/nvme/
+                my $nvme_dir = "/sys/class/nvme";
+                _debug(__LINE__, "Searching for NVMe devices in $nvme_dir matching PCI pattern $pci_pattern");
+                if (opendir(my $ndh, $nvme_dir)) {
+                    my @nvme_devs = grep { /^nvme\d+$/ && -d "$nvme_dir/$_" } readdir($ndh);
+                    closedir($ndh);
+                    
+                    _debug(__LINE__, "Found NVMe devices: " . join(", ", @nvme_devs));
+
+                    foreach my $nvme_dev (@nvme_devs) {
+                        # Check if this nvme device matches our PCI address
+                        my $device_link = readlink("$nvme_dir/$nvme_dev/device");
+                        if ($device_link && $device_link =~ /$pci_pattern/) {
+                            _debug(__LINE__, "NVMe device $nvme_dev matches PCI pattern $pci_pattern");
+                            # Found matching device
+                            $dev_path = "/dev/$nvme_dev" . "n1";
+                            $model  = read_sysfs("$nvme_dir/$nvme_dev/model");
+                            $serial = read_sysfs("$nvme_dir/$nvme_dev/serial");
+                            $found = 1;
+                            _debug(__LINE__, "Found NVMe device via /sys/class/nvme: $dev_path (matched $pci_pattern)");
+                            last;
+                        }
+                        _debug(__LINE__, "NVMe device $nvme_dev did not match PCI pattern $pci_pattern");
+                    }
+                }
+                
+                # Approach 2: Try direct block device lookup if not found
+                if (!$found && opendir(my $bdh, "/sys/class/block")) {
+                    my @block_devs = grep { /^nvme\d+n\d+$/ } readdir($bdh);
+                    closedir($bdh);
+                    
+                    foreach my $block_dev (@block_devs) {
+                        my $device_link = readlink("/sys/class/block/$block_dev/device");
+                        if ($device_link && $device_link =~ /$pci_pattern/) {
+                            $dev_path = "/dev/$block_dev";
+                            # For block devices, go up to the nvme controller for model/serial
+                            my $nvme_ctrl = $block_dev;
+                            $nvme_ctrl =~ s/n\d+$//;  # nvme0n1 -> nvme0
+                            $model  = read_sysfs("/sys/class/nvme/$nvme_ctrl/model");
+                            $serial = read_sysfs("/sys/class/nvme/$nvme_ctrl/serial");
+                            $found = 1;
+                            _debug(__LINE__, "Found NVMe device via /sys/class/block: $dev_path (matched $pci_pattern)");
+                            last;
+                        }
+                    }
+                }
+                
+                unless ($found) {
+                    _debug(__LINE__, "Could not find device for nvme-pci-$pci_addr (pattern: $pci_pattern)");
+                }
+            } else {
+                next; # unknown device type
+            }
+            
+            # Cache the lookup result
+            $cache_ref->{$entry} = {
+                device_path => $dev_path,
+                model => $model,
+                serial => $serial
+            };
+            
+            _debug(__LINE__, "Drive: $entry -> $dev_path (Model: $model, Serial: $serial)");
+        }
+
+        # Add to result array
+        push @drive_names, [$entry, $dev_path, $model, $serial];
+    }
+
+    # Now enhance the sensors_data structure directly (not as string manipulation)
+    foreach my $drive_entry (@drive_names) {
+        my ($original_name, $dev_path, $model, $serial) = @$drive_entry;
+        
+        # Add metadata directly to the data structure
+        if (exists $sensors_data->{$original_name}) {
+            $sensors_data->{$original_name}->{device_path} = $dev_path;
+            $sensors_data->{$original_name}->{model} = $model;
+            $sensors_data->{$original_name}->{serial} = $serial;
+            _debug(__LINE__, "Enhanced $original_name with drive info");
+        }
+    }
+
+    # Re-encode as pretty JSON
+    my $enhanced_json = JSON->new->pretty->canonical->encode($sensors_data);
+    
+    return $enhanced_json;
+}
+
+sub _get_cpu_name {
+    my ($sensorsOutput, $cache_ref) = @_;
+    
+    # Use empty hash if no cache reference provided
+    $cache_ref //= {};
+    
+    # Parse sensors output to extract CPU entries
+    my $sensors_data;
+    eval {
+        $sensors_data = decode_json($sensorsOutput);
+    };
+    if ($@) {
+        _debug(__LINE__, "Failed to parse sensors JSON: $@");
+        return $sensorsOutput;  # Return original output on parse error
+    }
+    
+    # Extract CPU entries from sensors data
+    my @entries = grep { /^coretemp-isa-/ || /^k10temp-pci-/ } keys %{$sensors_data};
+    
+    _debug(__LINE__, "Found " . scalar(@entries) . " CPU entries in sensors output");
+    
+    foreach my $entry (@entries) {
+        my ($cpu_model, $pkg) = ("unknown", "unknown");
+        
+        # Check cache first
+        if (exists $cache_ref->{$entry}) {
+            my $cached = $cache_ref->{$entry};
+            $cpu_model = $cached->{model};
+            $pkg = $cached->{package};
+            _debug(__LINE__, "Using cached CPU info for $entry");
+        } else {
+            # Lookup CPU information
+            
+            # ----- Intel coretemp -----
+            if ($entry =~ /^coretemp-isa-(\d+)/) {
+                my $isa_id = $1;
+                
+                # Find matching hwmon device
+                for my $hwmon (glob "/sys/class/hwmon/hwmon*") {
+                    my $name = read_sysfs("$hwmon/name");
+                    next unless $name eq 'coretemp';
+                    
+                    my $dev = readlink("$hwmon/device");
+                    next unless $dev;
+                    
+                    # coretemp.0 → package 0
+                    if ($dev =~ /\.([0-9]+)$/) {
+                        $pkg = $1;
+                        $cpu_model = _cpu_model_by_package($pkg);
+                        _debug(__LINE__, "Found Intel CPU: $entry -> Package $pkg, Model: $cpu_model");
+                        last;
+                    }
+                }
+            }
+            
+            # ----- AMD k10temp -----
+            elsif ($entry =~ /^k10temp-pci-(\w+)/) {
+                my $pci_addr = $1;
+                
+                # Convert short PCI address to pattern
+                # k10temp-pci-00c3 -> 0000:00:18.3
+                my $pci_pattern;
+                if ($pci_addr =~ /^([0-9a-f]{2})([0-9a-f]{2})$/i) {
+                    # Short format like "00c3" -> "00:18" (bus:device)
+                    my ($bus, $dev_func) = ($1, $2);
+                    $pci_pattern = sprintf("%04x:%02x:%02x", 0, hex($bus), hex($dev_func));
+                    _debug(__LINE__, "Converted PCI address $pci_addr to pattern $pci_pattern");
+                }
+                
+                # Find matching hwmon device
+                for my $hwmon (glob "/sys/class/hwmon/hwmon*") {
+                    my $name = read_sysfs("$hwmon/name");
+                    next unless $name eq 'k10temp';
+                    
+                    my $dev = readlink("$hwmon/device");
+                    next unless $dev;
+                    
+                    if ($dev =~ /$pci_pattern/ || $dev =~ /$pci_addr/) {
+                        # For AMD, package/node info might be in different location
+                        # Try to determine from PCI device or use 0 as default
+                        $pkg = 0;
+                        
+                        # Attempt to find package from CPU topology
+                        if (opendir(my $dh, "/sys/devices/system/cpu")) {
+                            my @cpus = grep { /^cpu\d+$/ } readdir($dh);
+                            closedir($dh);
+                            
+                            foreach my $cpu (@cpus) {
+                                my $cpu_pkg = read_sysfs("/sys/devices/system/cpu/$cpu/topology/physical_package_id");
+                                if ($cpu_pkg ne "unknown" && $cpu_pkg =~ /^\d+$/) {
+                                    $pkg = $cpu_pkg;
+                                    last;
+                                }
+                            }
+                        }
+                        
+                        $cpu_model = _cpu_model_by_package($pkg);
+                        _debug(__LINE__, "Found AMD CPU: $entry -> Package $pkg, Model: $cpu_model");
+                        last;
+                    }
+                }
+            }
+            
+            # Cache the lookup result
+            $cache_ref->{$entry} = {
+                model => $cpu_model,
+                package => $pkg
+            };
+            
+            _debug(__LINE__, "CPU: $entry -> Package $pkg (Model: $cpu_model)");
+        }
+        
+        # Add metadata directly to the data structure
+        if (exists $sensors_data->{$entry}) {
+            $sensors_data->{$entry}->{cpu_model} = $cpu_model;
+            $sensors_data->{$entry}->{cpu_package} = $pkg;
+            _debug(__LINE__, "Enhanced $entry with CPU info");
+        }
+    }
+    
+    # Re-encode as pretty JSON
+    my $enhanced_json = JSON->new->pretty->canonical->encode($sensors_data);
+    
+    return $enhanced_json;
+}
+
+sub read_sysfs {
+    my ($path) = @_;
+    
+    return "unknown" unless defined $path && -f $path;
+    
+    if (open my $fh, '<', $path) {
+        my $value = <$fh>;
+        close $fh;
+        
+        if (defined $value) {
+            chomp $value;
+            # Remove leading/trailing whitespace
+            $value =~ s/^\s+|\s+$//g;
+            return $value ne '' ? $value : "unknown";
+        }
+    }
+    
+    return "unknown";
+}
+
+# Helper function to get CPU model by package ID
+sub _cpu_model_by_package {
+    my ($pkg) = @_;
+    
+    # Try to read from /proc/cpuinfo
+    if (open my $fh, '<', '/proc/cpuinfo') {
+        my $current_pkg = -1;
+        my $model_name = "unknown";
+        
+        while (my $line = <$fh>) {
+            chomp $line;
+            
+            # Extract physical id
+            if ($line =~ /^physical id\s+:\s+(\d+)/) {
+                $current_pkg = $1;
+            }
+            
+            # Extract model name
+            if ($line =~ /^model name\s+:\s+(.+)$/) {
+                $model_name = $1;
+                $model_name =~ s/^\s+|\s+$//g;  # Trim whitespace
+                
+                # If this is the package we're looking for, return it
+                if ($current_pkg == $pkg) {
+                    close($fh);
+                    return $model_name;
+                }
+            }
+        }
+        close($fh);
+        
+        # If we didn't find the specific package, return the last model found
+        # (single socket systems won't have physical id)
+        return $model_name if $model_name ne "unknown";
+    }
+    
+    return "unknown";
 }
 
 # ============================================================================
@@ -513,7 +1102,6 @@ sub _pve_mod_hello {
 sub get_graphic_stats {
     #  todo name the process without overruling other processes
     _debug(__LINE__, "get_graphic_stats called");
-    _pve_mod_hello();
     
     # Start PVE Mod
     _pve_mod_starter();
@@ -605,6 +1193,39 @@ sub get_graphic_stats {
     return $last_snapshot;
 }
 
+sub get_sensors_stats {
+    _debug(__LINE__, "get_sensors_stats called");
+
+    # Start PVE Mod
+    _pve_mod_starter();
+
+    unless (-f $sensors_state_file) {
+        _debug(__LINE__, "Sensors state file does not exist: $sensors_state_file");
+        return {};
+    }
+
+    my $sensors_data;
+    eval {
+        open my $fh, '<', $sensors_state_file or die "Failed to open $sensors_state_file: $!";
+        local $/;
+        my $json = <$fh>;
+        close($fh);
+        $sensors_data = $json;
+        _debug(__LINE__, "Read sensors data, JSON length: " . length($json) . " bytes");
+        _debug(__LINE__, "Read sensors data from $sensors_state_file");
+    };
+    if ($@) {
+        _debug(__LINE__, "Failed to read/parse sensors data: $@");
+        return {};
+    }
+
+
+    # Notify pve_mod_worker of activity
+    _notify_pve_mod_worker();
+
+    return $sensors_data;
+}
+
 # ============================================================================
 # Main Collector
 # ============================================================================
@@ -619,34 +1240,13 @@ sub _start_graphics_collectors {
         _debug(__LINE__, "Starting graphics collectors");
     }
 
-    # NOW check if collectors are already running (while holding startup lock)
-    my %existing_collectors;
-    if (-f $lock_file) {
-        _debug(__LINE__, "Lock file exists: $lock_file");
-        if (open(my $lock_fh, '<', $lock_file)) {
-            _debug(__LINE__, "Opened lock file for reading");
-            flock($lock_fh, LOCK_EX) or _debug(__LINE__, "Failed to lock $lock_file: $!");
-            while (my $line = <$lock_fh>) {
-                chomp $line;
-                if ($line =~ /^(\d+)\s+(\S+)/) {
-                    $existing_collectors{$2} = $1;
-                } elsif ($line =~ /^(\d+)$/) {
-                    # Backward compatibility: only PID, no card
-                    $existing_collectors{"unknown"} = $1;
-                }
-            }
-            close($lock_fh);
-        } else {
-            _debug(__LINE__, "Failed to open lock file: $!");
-        }
-    } else {
-        _debug(__LINE__, "Lock file does not exist. Clean start");
-    }
+    # Read existing collectors from lock file
+    my %existing_collectors = _read_collector_lock($lock_file);
     
     # Generalized device collector management for future AMD/NVIDIA support
     my @all_devices;
     my @all_types;
-    my @all_collectors;
+    my @all_collector_subs;
 
     # Intel
     if ($intel_gpu_enabled) {
@@ -658,14 +1258,16 @@ sub _start_graphics_collectors {
         my @intel_devices = _get_intel_gpu_devices();
         unless (@intel_devices) {
             _debug(__LINE__, "No Intel GPU devices found");
-            return;
-        }
-        _debug(__LINE__, "Found " . scalar(@intel_devices) . " Intel GPU device(s)");
-        foreach my $device (@intel_devices) {
-            push @all_devices, $device;
-            push @all_types, 'intel';
+        } else {
+            _debug(__LINE__, "Found " . scalar(@intel_devices) . " Intel GPU device(s)");
+            foreach my $device (@intel_devices) {
+                push @all_devices, $device;
+                push @all_types, 'intel';
+                push @all_collector_subs, \&_collector_for_intel_device;
+            }
         }
     }
+    
     # AMD (future)
     if ($amd_gpu_enabled) {
         _debug(__LINE__, "AMD GPU support enabled");
@@ -677,118 +1279,131 @@ sub _start_graphics_collectors {
         foreach my $device (@amd_devices) {
             push @all_devices, $device;
             push @all_types, 'amd';
+            push @all_collector_subs, \&_collector_for_amd_device;
         }
     }
+    
     # NVIDIA (future)
     if ($nvidia_gpu_enabled) {
         _debug(__LINE__, "NVIDIA GPU support enabled");
-
-        # return unless _check_executable('/usr/bin/nvidia-smi', 'NVIDIA');
 
         my @nvidia_devices = get_nvidia_gpu_devices();
         _debug(__LINE__, "Got " . scalar(@nvidia_devices) . " NVIDIA devices");
         foreach my $device (@nvidia_devices) {
             push @all_devices, $device;
             push @all_types, 'nvidia';
+            push @all_collector_subs, \&collector_for_nvidia_device;
         }
     }
 
-    my @child_pids;
-    my @child_devices;
-    my @child_types;
+    _debug(__LINE__, "Finished detecting devices. Total collectors to manage: " . scalar(@all_devices));
+
+    my @collector_entries;
+    
     for (my $i = 0; $i < @all_devices; $i++) {
         my $device = $all_devices[$i];
         my $type = $all_types[$i];
-        my $card = $device->{card};
-        my $existing_pid = $existing_collectors{$card};
-        if ($existing_pid && _is_process_alive($existing_pid)) {
-            _debug(__LINE__, "Collector for $type $card already running with PID $existing_pid");
-            push @child_pids, $existing_pid;
-            push @child_devices, $device;
-            push @child_types, $type;
+        my $collector_sub = $all_collector_subs[$i];
+        my $device_name = $device->{card} // $device->{name} // "device$i";
+        
+        # Check if collector already running
+        my $existing_pid = _is_collector_running($device_name, $lock_file);
+        if ($existing_pid) {
+            _debug(__LINE__, "Collector for $type $device_name already running with PID $existing_pid");
+            push @collector_entries, [$existing_pid, $device_name, $type];
             next;
         }
-        _debug(__LINE__, "About to fork collector for $type $card");
-        my $pid = fork();
-        unless (defined $pid) {
-            _debug(__LINE__, "fork failed: $!");
-            unlink($startup_lock);
-            die "fork failed: $!";
-        }
-        if ($pid == 0) {
-            # Child process
-            _debug(__LINE__, "In child process for $type $card");
-            if ($type eq 'intel') {
-                _collector_for_intel_device($device);
-            } elsif ($type eq 'amd') {
-                _collector_for_amd_device($device);
-            } elsif ($type eq 'nvidia') {
-                collector_for_nvidia_device($device);
-            } else {
-                _debug(__LINE__, "Unknown GPU type $type for $card");
-                exit(1);
-            }
-            # Should not reach here
-            exit(0);
-        } else {
-            _debug(__LINE__, "Forked child PID $pid for $type $card");
-            push @child_pids, $pid;
-            push @child_devices, $device;
-            push @child_types, $type;
+        
+        # Start new collector
+        my $pid = _start_child_collector($device_name, $collector_sub, $device);
+        if ($pid) {
+            push @collector_entries, [$pid, $device_name, $type];
         }
     }
-    _debug(__LINE__, "Active children: " . join(", ", @child_pids));
-
-    # Write child PIDs and device cards/types to lock file
-    if (open(my $lock_fh, '>', $lock_file)) {
-        _debug(__LINE__, "Opened lock file for writing");
-        for (my $i = 0; $i < @child_pids; $i++) {
-            my $pid = $child_pids[$i];
-            my $device = $child_devices[$i];
-            my $type = $child_types[$i];
-            my $card = $device->{card} // '';
-            print $lock_fh "$pid $card $type\n";
+    
+    # Write all collector PIDs to lock file
+    unless (_write_collector_lock($lock_file, @collector_entries)) {
+        _debug(__LINE__, "Failed to write lock file, terminating collectors");
+        foreach my $entry (@collector_entries) {
+            kill 'TERM', $entry->[0];
         }
-        flock($lock_fh, LOCK_UN);
-        close($lock_fh);
-        _debug(__LINE__, "Wrote " . scalar(@child_pids) . " collector PID(s) to lock file");
-    } else {
-        _debug(__LINE__, "Failed to open lock file for writing: $!");
-        foreach my $pid (@child_pids) {
-            _debug(__LINE__, "Killing child $pid due to lock file write failure");
-            kill 'TERM', $pid;
-        }
-        unlink($startup_lock);
         return;
     }
     
-    # Wait briefly to ensure collector is actually running
+    # Wait briefly to ensure collectors are running
     sleep 0.1;
 
-    # Verify at least one child is still alive (by PID only)
+    # Verify collectors are alive
     my $any_alive = 0;
-    for (my $i = 0; $i < @child_pids; $i++) {
-        my $pid = $child_pids[$i];
-        my $device = $child_devices[$i];
-        my $card = $device->{card} // '';
-        my $alive = kill(0, $pid);
-        if ($alive) {
+    foreach my $entry (@collector_entries) {
+        my ($pid, $name, $type) = @$entry;
+        if (kill(0, $pid)) {
             $any_alive = 1;
-            _debug(__LINE__, "Verified child PID $pid for $card is alive");
+            _debug(__LINE__, "Verified $type collector $name (PID $pid) is alive");
         } else {
-            _debug(__LINE__, "WARNING - Child PID $pid for $card died immediately!");
+            _debug(__LINE__, "WARNING - $type collector $name (PID $pid) died immediately!");
         }
     }
+    
     unless ($any_alive) {
-        _debug(__LINE__, "ERROR - No children alive after fork!");
+        _debug(__LINE__, "ERROR - No collectors alive after fork!");
+        return;
     }
 
-    _debug(__LINE__, "Graphics collectors started");
+    _debug(__LINE__, "All graphics collectors started successfully");
+}
+
+sub _start_sensors_collector {
+    _debug(__LINE__, "Starting temperature sensor collector");
+    
+    # Check if sensors is available
+    unless (-x '/usr/bin/sensors') {
+        _debug(__LINE__, "sensors not available, skipping");
+        return;
+    }
+    
+    # Check if already running
+    my $existing_pid = _is_collector_running('sensors', $lock_file);
+    if ($existing_pid) {
+        _debug(__LINE__, "Sensors collector already running with PID $existing_pid");
+        return;
+    }
+    
+    # Start the collector
+    my $pid = _start_child_collector('sensors', \&_collector_for_temperature_sensors, { name => 'sensors' });
+    
+    if ($pid) {
+        # Read existing entries
+        my @collector_entries;
+        my %existing = _read_collector_lock($lock_file);
+        foreach my $name (keys %existing) {
+            push @collector_entries, [$existing{$name}->{pid}, $name, $existing{$name}->{type}];
+        }
+        
+        # Add sensors entry
+        push @collector_entries, [$pid, 'sensors', 'sensors'];
+        
+        # Write updated lock file
+        unless (_write_collector_lock($lock_file, @collector_entries)) {
+            _debug(__LINE__, "Failed to update lock file, terminating sensors collector");
+            kill 'TERM', $pid;
+            return;
+        }
+        
+        # Verify it's alive
+        sleep 0.1;
+        if (kill(0, $pid)) {
+            _debug(__LINE__, "Verified sensors collector (PID $pid) is alive");
+        } else {
+            _debug(__LINE__, "WARNING - Sensors collector (PID $pid) died immediately!");
+        }
+    }
 }
 
 # ============================================================================
 # PVE Mod Worker
 # ============================================================================
+
 sub _pve_mod_starter {
     # Check if pve_mod_worker is already running - if so, entire system is already up
     _debug(__LINE__, "Checking if pve_mod_worker is already running");
@@ -797,6 +1412,8 @@ sub _pve_mod_starter {
         return "pve_mod_worker process already running, system is already started";
     }
     _debug(__LINE__, "PVE mod worker is not running. PVE Mod will be started.");
+
+    _pve_mod_hello();
 
     # Ensure directory exists
     _ensure_pve_mod_directory_exists();
@@ -808,21 +1425,16 @@ sub _pve_mod_starter {
     print $startup_fh "$$\n";
     close($startup_fh);
     _debug(__LINE__, "Wrote PID, $$, to startup lock");
-    
-    
+
+    # Start sensors collector first
+    _start_sensors_collector();
 
     # Start graphics collectors
     _start_graphics_collectors();
 
-    # Start sensor collector
-    # TBD
-
-    # Start UPS collector
-    # TBD
-
     _debug(__LINE__, "All collectors started");
 
-    # Start pve mod workers
+    # Start pve mod worker
     _pve_mod_worker();
 
     # Remove startup lock LAST
