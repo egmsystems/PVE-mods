@@ -48875,46 +48875,177 @@ Ext.define('PVE.node.StatusView', {
 
     defaults: {
         xtype: 'pmxInfoWidget',
-        padding: '0 10 5 10',
+        padding: '0 10 2 10',
     },
 
     items: [
+        // ========== PRIMARY KPIs (Tier 1) ==========
         {
-            itemId: 'cpuss',
+            xtype: 'box',
             colspan: 2,
-            printBar: false,
-            title: gettext('CPU (s)'),
-            textField: 'cpuinfo',
-            renderer: Proxmox.Utils.render_cpu_model,
-            value: '',            
-        },        
+            padding: '0',
+            html: '<div style="font-size: 16px; font-weight: bold; margin: 5px 0 3px 0; padding: 3px 0; border-bottom: 2px solid #ddd;">Primary Metrics</div>',
+        },
         {
             itemId: 'cpu',
             iconCls: 'fa fa-fw pmx-itype-icon-processor pmx-icon',
-            title: gettext('Usage'),
+            title: gettext('CPU Usage'),
             valueField: 'cpu',
             maxField: 'cpuinfo',
-            renderer: Proxmox.Utils.render_node_cpu_usage,
+            renderer: function(value, record) {
+                let result = Proxmox.Utils.render_node_cpu_usage(value, record);
+                // Append CPU model if available
+                if (record && record.cpuinfo && record.cpuinfo.model) {
+                    result += ` (${record.cpuinfo.model})`;
+                }
+                return result;
+            },
         },
         {
-            itemId: 'wait',
-            iconCls: 'fa fa-fw fa-clock-o',
-            title: gettext('IO delay'),
-            valueField: 'wait',
-            rowspan: 2,
+            iconCls: 'fa fa-fw pmx-itype-icon-memory pmx-icon',
+            itemId: 'memory',
+            title: gettext('Memory Usage'),
+            valueField: 'memory',
+            maxField: 'memory',
+            warningThreshold: 0.9,
+            criticalThreshold: 0.975,
+            renderer: Proxmox.Utils.render_node_size_usage,
+        },
+        {
+            itemId: 'ksm',
+            iconCls: 'fa fa-fw fa-clone',
+            printBar: false,
+            title: gettext('KSM sharing'),
+            textField: 'ksm',
+            renderer: function (record) {
+                return Proxmox.Utils.render_size(record.shared);
+            },
+        },
+        {
+            itemId: 'gpu',
+            iconCls: 'fa fa-fw fa-desktop',
+            title: gettext('GPU Usage'),
+            printBar: false,
+            textField: 'gpuStats',
+            renderer: function(gpuStats) {
+                if (!gpuStats || !gpuStats.Graphics) {
+                    return '';
+                }
+
+                let hasActiveGPU = false;
+                let gpuName = '';
+
+                // Check Intel GPUs
+                if (gpuStats.Graphics.Intel) {
+                    const keys = Object.keys(gpuStats.Graphics.Intel).sort();
+                    if (keys.length > 0) {
+                        const gpuData = gpuStats.Graphics.Intel[keys[0]];
+                        hasActiveGPU = true;
+                        gpuName = gpuData.name;
+                    }
+                }
+
+                // Check NVIDIA GPUs
+                if (gpuStats.Graphics.NVIDIA) {
+                    const keys = Object.keys(gpuStats.Graphics.NVIDIA).sort();
+                    if (keys.length > 0) {
+                        const stats = gpuStats.Graphics.NVIDIA[keys[0]].stats;
+                        hasActiveGPU = true;
+                        gpuName = stats.name;
+                    }
+                }
+
+                return hasActiveGPU ? gpuName : '';
+            },
+        },
+        {
+            itemId: 'gpu_usage',
+            iconCls: 'fa fa-fw fa-desktop',
+            title: gettext('GPU 0'),
+            valueField: 'gpuStats',
+            printBar: false,
+            textField: 'gpuStats',
+            renderer: function(gpuStats) {
+                if (!gpuStats || !gpuStats.Graphics) {
+                    return '';
+                }
+
+                // Check Intel GPUs
+                if (gpuStats.Graphics.Intel) {
+                    const keys = Object.keys(gpuStats.Graphics.Intel).sort();
+                    if (keys.length > 0) {
+                        const gpuData = gpuStats.Graphics.Intel[keys[0]];
+                        if (gpuData.stats.engines && gpuData.stats.engines['Render/3D']) {
+                            const usage = gpuData.stats.engines['Render/3D'].busy;
+                            return `${usage}%`;
+                        }
+                    }
+                }
+
+                // Check NVIDIA GPUs
+                if (gpuStats.Graphics.NVIDIA) {
+                    const keys = Object.keys(gpuStats.Graphics.NVIDIA).sort();
+                    if (keys.length > 0) {
+                        const stats = gpuStats.Graphics.NVIDIA[keys[0]].stats;
+                        if (stats.utilization) {
+                            return `${stats.utilization.gpu}%`;
+                        }
+                    }
+                }
+
+                return '';
+            },
+        },
+        {
+            iconCls: 'fa fa-fw fa-hdd-o',
+            itemId: 'rootfs',
+            title: gettext('Disk (/) Usage'),
+            valueField: 'rootfs',
+            maxField: 'rootfs',
+            renderer: Proxmox.Utils.render_node_size_usage,
+        },
+        {
+            iconCls: 'fa fa-fw fa-refresh',
+            itemId: 'swap',
+            title: gettext('SWAP Usage'),
+            valueField: 'swap',
+            maxField: 'swap',
+            warningThreshold: 0.4,
+            criticalThreshold: 0.8,
+            renderer: Proxmox.Utils.render_node_size_usage,
+        },
+        // Fill the remaining cell so the next colspan:2 section header starts on a new row.
+        {
+            xtype: 'box',
+            html: '',
+            padding: 0,
+        },
+        
+        // ========== SECONDARY DETAILS (Tier 2) ==========
+        {
+            xtype: 'box',
+            colspan: 2,
+            padding: '15 0 5 0',
+            html: '<div style="font-size: 14px; font-weight: bold; margin: 10px 0 5px 0; padding: 5px 0; border-bottom: 1px solid #eee; color: #666;">Secondary Details</div>',
         },
         {
             itemId: 'load',
             iconCls: 'fa fa-fw fa-tasks',
-            title: gettext('Load average'),
+            title: gettext('CPU Load Average'),
             printBar: false,
             textField: 'loadavg',
+        },
+        {
+            itemId: 'wait',
+            iconCls: 'fa fa-fw fa-clock-o',
+            title: gettext('CPU I/O Delay'),
+            valueField: 'wait',
         },
         {
             itemId: 'thermalCpu',
             colspan: 2,
             printBar: false,
-            title: gettext('Thermal State'),
+            title: gettext('CPU Thermal State'),
             iconCls: 'fa fa-fw fa-thermometer-half',
             textField: 'sensorsOutput',
             renderer: function(value){
@@ -49062,139 +49193,108 @@ Ext.define('PVE.node.StatusView', {
                     }
                 });
                 
-                let result = '';
+                let html = '<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">';
                 temps.forEach((cpuData, cpuIndex) => {
                     const strCoreTemps = cpuData.temps.map((strTemp, index, arr) => { 
                         return strTemp + (index + 1 < arr.length ? (itemsPerRow > 0 && (index + 1) % itemsPerRow === 0 ? '<br>' : '&nbsp;| ') : ''); 
                     });
                     if(strCoreTemps.length > 0) {
-                        let cpuPrefix = cpuCount > 1 ? `CPU ${cpuIndex + 1}` : 'CPU';
-                        let cpuModelStr = cpuData.model ? ` (${cpuData.model})` : '';
-                        result += `${cpuPrefix}${cpuModelStr}: ` + strCoreTemps.join('') + (cpuIndex < cpuCount - 1 ? '<br>' : '');
+                        let cpuLabel = cpuCount > 1 ? `Socket ${cpuIndex + 1}` : 'Socket 1';
+                        let cpuModelStr = cpuData.model || 'Unknown CPU';
+                        
+                        html += '<tr>';
+                        html += `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${cpuModelStr}</td>`;
+                        html += `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">${strCoreTemps.join('')}</td>`;
+                        html += '</tr>';
                     }
                 });
-                
-                return '<div style="text-align: left; margin-left: 28px;">' + (result.length > 0 ? result : 'N/A') + '</div>';
+                html += '</table>';
+				
+                return html.indexOf('<tr>') > 0
+                    ? '<div style="padding-left: 20px; box-sizing: border-box;">' + html + '</div>'
+                    : 'N/A';
             }
         },
         {
-            xtype: 'box',
+            itemId: 'gpu_details',
             colspan: 2,
-            padding: '0 0 10 0',
-        },
-        {
-            itemId: 'memory2',
-            colspan: 2,
-            printBar: false,
-            title: gettext('Memory'),
-            textField: 'Memory',          
-        },          
-        {
-            iconCls: 'fa fa-fw pmx-itype-icon-memory pmx-icon',
-            itemId: 'memory',
-            title: gettext('Usage'),
-            valueField: 'memory',
-            maxField: 'memory',
-            warningThreshold: 0.9,
-            criticalThreshold: 0.975,
-            // TODO: split out ARC usage
-            renderer: Proxmox.Utils.render_node_size_usage,
-        },
-        {
-            itemId: 'ksm',
-            printBar: false,
-            title: gettext('KSM sharing'),
-            textField: 'ksm',
-            renderer: function (record) {
-                return Proxmox.Utils.render_size(record.shared);
-            },
-            padding: '0 10 10 10',
-        },
-        {
-            xtype: 'box',
-            colspan: 2,
-            padding: '0 0 10 0',
-        },        
-        {
-            itemId: 'gpu_heading',
-            colspan: 2,
-            printBar: false,
-            title: gettext('GPU(s)'),
-            textField: 'Memory',          
-        },                  
-        {
-            itemId: 'gpu',
-            colspan: 2,
-            iconCls: 'fa fa-desktop',
-            title: gettext('Device'),
+            iconCls: 'fa fa-fw fa-desktop',
+            title: gettext('GPU Details'),
             printBar: false,
             textField: 'gpuStats',
             renderer: function(gpuStats) {
-                if (!gpuStats || !gpuStats.Graphics || !gpuStats.Graphics.Intel) {
-                    return 'N/A';
+                if (!gpuStats || !gpuStats.Graphics) {
+                    return '';
                 }
 
-                let html = '';
-                
-                console.log(gpuStats);
+                let html = '<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">';
 
-                // Intel GPUs
+                // Intel GPUs - Secondary details
                 if (gpuStats.Graphics.Intel) {
                     Object.keys(gpuStats.Graphics.Intel).sort().forEach(key => {
                         const gpuData = gpuStats.Graphics.Intel[key];
-                        html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
-                        html += `<div style="text-align: left; flex: 1;">${gpuData.name}</div>`;
-                        html += `<div style="text-align: right; flex: 1;">`;
                         
+                        let details = [];
+                        
+                        // All engine details
                         if (gpuData.stats.engines) {
-                            // Render/3D
                             if (gpuData.stats.engines['Render/3D']) {
-                                html += `Render/3D: ${gpuData.stats.engines['Render/3D'].busy}% | `;
+                                details.push(`Render/3D: ${gpuData.stats.engines['Render/3D'].busy}%`);
                             }
-                            
-                            // Video
                             if (gpuData.stats.engines['Video']) {
-                                html += `Video: ${gpuData.stats.engines['Video'].busy}% | `;
+                                details.push(`Video: ${gpuData.stats.engines['Video'].busy}%`);
                             }
-                            
-                            // Blitter
                             if (gpuData.stats.engines['Blitter']) {
-                                html += `Blitter: ${gpuData.stats.engines['Blitter'].busy}% | `;
+                                details.push(`Blitter: ${gpuData.stats.engines['Blitter'].busy}%`);
                             }
-                            
-                            // VideoEnhance
                             if (gpuData.stats.engines['VideoEnhance']) {
-                                html += `VideoEnhance: ${gpuData.stats.engines['VideoEnhance'].busy}% | `;
+                                details.push(`VideoEnhance: ${gpuData.stats.engines['VideoEnhance'].busy}%`);
                             }
                         }
                         
-                        // Power and Frequency info
-                        html += `Power: ${gpuData.stats.power?.GPU ?? 'N/A'} / ${gpuData.stats.power?.Package ?? 'N/A'} ${gpuData.stats.power?.unit || 'W'}`;
-                        html += ` | Freq: ${gpuData.stats.frequency?.actual ?? 'N/A'}/${gpuData.stats.frequency?.requested ?? 'N/A'} ${gpuData.frequency?.unit || 'MHz'}`;
+                        // Power
+                        if (gpuData.stats.power) {
+                            details.push(`Power: ${gpuData.stats.power?.GPU ?? 'N/A'} / ${gpuData.stats.power?.Package ?? 'N/A'} ${gpuData.stats.power?.unit || 'W'}`);
+                        }
                         
-                        html += `</div></div>`;
+                        // Frequency
+                        if (gpuData.stats.frequency) {
+                            details.push(`Freq: ${gpuData.stats.frequency?.actual ?? 'N/A'}/${gpuData.stats.frequency?.requested ?? 'N/A'} ${gpuData.stats.frequency?.unit || 'MHz'}`);
+                        }
+                        
+                        html += '<tr>';
+                        html += `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${gpuData.name}</td>`;
+                        html += `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">${details.join(' | ')}</td>`;
+                        html += '</tr>';
                     });
                 }
 
-                // NVIDIA GPUs
+                // NVIDIA GPUs - Secondary details
                 if (gpuStats.Graphics.NVIDIA) {
                     Object.keys(gpuStats.Graphics.NVIDIA).sort().forEach(key => {
                         const gpuData = gpuStats.Graphics.NVIDIA[key];
                         const stats = gpuData.stats;
                         
-                        html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
-                        html += `<div style="text-align: left; flex: 1;">${stats.name}</div>`;
-                        html += `<div style="text-align: right; flex: 1;">`;
+                        let details = [];
                         
-                        // GPU Utilization
-                        if (stats.utilization) {
-                            html += `GPU: ${stats.utilization.gpu}${stats.utilization.unit} | `;
-                            html += `MEM: ${stats.utilization.memory}${stats.utilization.unit} | `;
+                        // Memory Utilization
+                        if (stats.utilization && stats.utilization.memory) {
+                            const memUsage = parseInt(stats.utilization.memory);
+                            let memStyle = '';
+                            if (memUsage >= 90) memStyle = 'color: #d9534f; font-weight: bold;';
+                            else if (memUsage >= 70) memStyle = 'color: #f0ad4e; font-weight: bold;';
+                            details.push(`<span style="${memStyle}">MEM: ${stats.utilization.memory}%</span>`);
                         }
                         
-                        // Memory Usage
+                        // VRAM Usage
                         if (stats.memory) {
-                            html += `VRAM: ${stats.memory.used}/${stats.memory.total} ${stats.memory.unit} | `;
+                            const vramUsedGB = parseInt(stats.memory.used);
+                            const vramTotalGB = parseInt(stats.memory.total);
+                            const vramPercent = (vramUsedGB / vramTotalGB) * 100;
+                            let vramStyle = '';
+                            if (vramPercent >= 90) vramStyle = 'color: #d9534f; font-weight: bold;';
+                            else if (vramPercent >= 70) vramStyle = 'color: #f0ad4e; font-weight: bold;';
+                            details.push(`<span style="${vramStyle}">VRAM: ${stats.memory.used}/${stats.memory.total} ${stats.memory.unit}</span>`);
                         }
                         
                         // Temperature
@@ -49205,62 +49305,32 @@ Ext.define('PVE.node.StatusView', {
                             } else if (stats.temperature.gpu >= 70) {
                                 tempStyle = 'color: #FFC300; font-weight: bold;';
                             }
-                            html += `Temp: <span style="${tempStyle}">${stats.temperature.gpu}${stats.temperature.unit}</span> | `;
-                        }
-                        
-                        // Fan Speed
-                        if (stats.fan) {
-                            html += `Fan: ${stats.fan.speed}${stats.fan.unit} | `;
+                            details.push(`Temp: <span style="${tempStyle}">${stats.temperature.gpu}${stats.temperature.unit}</span>`);
                         }
                         
                         // Power
                         if (stats.power) {
-                            html += `Power: ${stats.power.draw}/${stats.power.limit} ${stats.power.unit}`;
+                            details.push(`Power: ${stats.power.draw}/${stats.power.limit} ${stats.power.unit}`);
                         }
                         
-                        html += `</div></div>`;
+                        html += '<tr>';
+                        html += `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${stats.name}</td>`;
+                        html += `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">${details.join(' | ')}</td>`;
+                        html += '</tr>';
                     });
                 }
 
-                // todo add AMD
-
-                return html;
+                html += '</table>';
+                return html.indexOf('<tr>') > 0
+                    ? '<div style="padding-left: 20px; box-sizing: border-box;">' + html + '</div>'
+                    : '';
             },
-        },        
-        {
-            xtype: 'box',
-            colspan: 2,
-            padding: '0 0 10 0',
         },
-        {
-            itemId: 'Storage',
-            colspan: 2,
-            printBar: false,
-            title: gettext('Storage'),
-            textField: 'Memory',
-        },          
-        {
-            iconCls: 'fa fa-fw fa-hdd-o',
-            itemId: 'rootfs',
-            title: '/ ' + gettext('HD space'),
-            valueField: 'rootfs',
-            maxField: 'rootfs',
-            renderer: Proxmox.Utils.render_node_size_usage,
-        },
-        {
-            iconCls: 'fa fa-fw fa-refresh',
-            itemId: 'swap',
-            printSize: true,
-            title: gettext('SWAP usage'),
-            valueField: 'swap',
-            maxField: 'swap',
-            renderer: Proxmox.Utils.render_node_size_usage,
-        },      
         {
 			itemId: 'thermalNvme',
 			colspan: 2,
 			printBar: false,
-			title: gettext('NVMe Thermal State'),
+			title: gettext('NVMe Temperatures'),
 			iconCls: 'fa fa-fw fa-thermometer-half',
 			textField: 'sensorsOutput',
 			renderer: function(value) {
@@ -49279,7 +49349,7 @@ Ext.define('PVE.node.StatusView', {
 					objValue = {};
 				}
 				const nvmeKeys = Object.keys(objValue).filter(item => String(item).startsWith(addressPrefix)).sort();
-				let temps = [];
+				let nvmeData = [];
 				nvmeKeys.forEach((nvmeKey, index) => {
 					try {
 						let tempVal = NaN, tempMax = NaN, tempCrit = NaN, model = '', serial = '';
@@ -49291,9 +49361,10 @@ Ext.define('PVE.node.StatusView', {
 							} else if (secondLevelKey.endsWith('_crit')) {
 								tempCrit = tempHelper.getTemp(parseFloat(objValue[nvmeKey][sensorName][secondLevelKey]));
 							}
-                            model = objValue[nvmeKey]['model'] || '';
-                            serial = objValue[nvmeKey]['serial'] || '';
 						});
+						model = objValue[nvmeKey]['model'] || 'Unknown';
+						serial = objValue[nvmeKey]['serial'] || '';
+						
 						if (!isNaN(tempVal)) {
 							let tempStyle = '';
 							if (!isNaN(tempMax) && tempVal >= tempMax) {
@@ -49302,31 +49373,49 @@ Ext.define('PVE.node.StatusView', {
 							if (!isNaN(tempCrit) && tempVal >= tempCrit) {
 								tempStyle = 'color: red; font-weight: bold;';
 							}
-                            const tempStr = `${model}&nbsp;(${serial}):&nbsp;<span style="${tempStyle}">${Ext.util.Format.number(tempVal, '0.0')}${tempHelper.getUnit()}</span>`;
-							temps.push(tempStr);
+							nvmeData.push({
+								model: model,
+								serial: serial,
+								temp: tempVal,
+								tempStyle: tempStyle,
+								unit: tempHelper.getUnit()
+							});
 						}
 					} catch(e) { /*_*/ }
 				});
-				const result = temps.map((strTemp, index, arr) => { return strTemp + (index + 1 < arr.length ? ((index + 1) % itemsPerRow === 0 ? '<br>' : '&nbsp;| ') : ''); });
-				return '<div style="text-align: left; margin-left: 28px;">' + (result.length > 0 ? result.join('') : 'N/A') + '</div>';
+				
+                if (nvmeData.length === 0) {
+                    return 'N/A';
+                }
+				
+                let html = '<table style="width: 100%; border-collapse: collapse; table-layout: fixed;">';
+				nvmeData.forEach((data) => {
+					let deviceName = data.model;
+					if (data.serial) {
+						deviceName += ` (${data.serial})`;
+					}
+					html += '<tr>';
+                    html += `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${deviceName}</td>`;
+                    html += `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;"><span style="${data.tempStyle}">${Ext.util.Format.number(data.temp, '0.0')}${data.unit}</span></td>`;
+					html += '</tr>';
+				});
+				html += '</table>';
+				return '<div style="padding-left: 20px; box-sizing: border-box;">' + html + '</div>';
             }
         },
+        
+        // ========== TERTIARY DIAGNOSTICS (Tier 3) ==========
         {
             xtype: 'box',
             colspan: 2,
-            padding: '0 0 10 0',
-        },                 
-        {
-            itemId: 'Coooling',
-            colspan: 2,
-            printBar: false,
-            title: gettext('Cooling'),
+            padding: '15 0 5 0',
+            html: '<div style="font-size: 13px; font-weight: bold; margin: 10px 0 5px 0; padding: 5px 0; border-bottom: 1px solid #eee; color: #666;">Diagnostics</div>',
         },
         {
             itemId: 'speedFan',
             colspan: 2,
             printBar: false,
-            title: gettext('Fan Speed(s)'),
+            title: gettext('System Fans'),
             iconCls: 'fa fa-fw fa-snowflake-o',
             textField: 'sensorsOutput',
             renderer: function(value) {
@@ -49381,19 +49470,54 @@ Ext.define('PVE.node.StatusView', {
                     }
                     });
                 });
-                return '<div style="text-align: left; margin-left: 28px;">' + (speeds.length > 0 ? speeds.join(' | ') : 'N/A') + '</div>';
+                return '<div style="text-align: left; margin-left: 20px;">' + (speeds.length > 0 ? speeds.join(' | ') : 'N/A') + '</div>';
             }
         },
         {
-			xtype: 'box',
-			colspan: 2,
-			html: gettext('UPS'),
-		},
-		{
+            itemId: 'gpuFans',
+            colspan: 2,
+            printBar: false,
+            title: gettext('GPU Fans'),
+            iconCls: 'fa fa-fw fa-snowflake-o',
+            textField: 'gpuStats',
+            renderer: function(gpuStats) {
+                if (!gpuStats || !gpuStats.Graphics || !gpuStats.Graphics.NVIDIA) {
+                    return 'N/A';
+                }
+
+                let rows = [];
+
+                Object.keys(gpuStats.Graphics.NVIDIA).sort().forEach(key => {
+                    const gpuData = gpuStats.Graphics.NVIDIA[key];
+                    const stats = gpuData?.stats;
+                    const fan = stats?.fan;
+
+                    if (!fan || fan.speed === undefined || fan.speed === null) {
+                        return;
+                    }
+
+                    const gpuName = stats?.name || key;
+                    const unit = fan.unit || '%';
+                    rows.push(
+                        '<tr>' +
+                        `<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">${gpuName}</td>` +
+                        `<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">Fan: ${fan.speed}${unit}</td>` +
+                        '</tr>',
+                    );
+                });
+
+                if (rows.length === 0) {
+                    return 'N/A';
+                }
+
+                return '<div style="padding-left: 20px; box-sizing: border-box;"><table style="width: 100%; border-collapse: collapse; table-layout: fixed;">' + rows.join('') + '</table></div>';
+            },
+        },
+        {
 			itemId: 'upsc',
 			colspan: 2,
 			printBar: false,
-			title: gettext('Device'),
+			title: gettext('UPS Status'),
 			iconCls: 'fa fa-fw fa-battery-three-quarters',
 			textField: 'upsStats',
 			renderer: function(value) {
@@ -49411,7 +49535,7 @@ Ext.define('PVE.node.StatusView', {
                 
                 // If objValue is null or empty, return N/A
                 if (!objValue || Object.keys(objValue).length === 0) {
-                    return '<div style="text-align: right;"><span>N/A</span></div>';
+                    return 'N/A';
                 }
 
                 // Helper function to get status color
@@ -49465,17 +49589,6 @@ Ext.define('PVE.node.StatusView', {
                     const batteryRuntimeLow = upsData['battery.runtime.low'];
                     const upsRealPowerNominal = upsData['ups.realpower.nominal'];
                     const batteryMfrDate = upsData['battery.mfr.date'];
-
-                    let displayItems = [];
-
-                    // First line: UPS identifier and model
-                    let modelLine = '';
-                    if (upsModel) {
-                        modelLine = `${upsModel}:`;
-                    } else {
-                        modelLine = `${upsKey}: N/A`;
-                    }
-                    displayItems.push(modelLine);
 
                     // Main status line with all metrics
                     let statusLine = '';
@@ -49566,39 +49679,35 @@ Ext.define('PVE.node.StatusView', {
                         statusLine += 'Output: <span>N/A</span>';
                     }
 
-                    displayItems.push(statusLine);
-
-                    // Combined battery and test line
-                    let batteryTestLine = '';
-                    if (batteryMfrDate) {
-                        batteryTestLine += '<span>Battery MFD: ' + batteryMfrDate + '</span>';
-                    } else {
-                        batteryTestLine += '<span>Battery MFD: N/A</span>';
-                    }
-
+                    // Append battery MFD + last test to the same line (single-line UPS summary)
+                    statusLine += ' | Battery MFD: ' + (batteryMfrDate || 'N/A');
                     if (testResult && !testResult.toLowerCase().includes('no test')) {
                         const testColor = testResult.toLowerCase().includes('passed') ? null : '#d9534f';
                         let testStyle = testColor ? ('color: ' + testColor + ';') : '';
-                        batteryTestLine += ' | <span style="' + testStyle + '">Test: ' + testResult + '</span>';
+                        statusLine += ' | <span style="' + testStyle + '">Test: ' + testResult + '</span>';
                     } else {
-                        batteryTestLine += ' | <span>Test: N/A</span>';
+                        statusLine += ' | Test: N/A';
                     }
-
-                    displayItems.push(batteryTestLine);
                     
-                    // Add this UPS's display to the overall collection
-                    allDisplayItems.push('<div style="margin-bottom: 10px;">' + displayItems.join('<br>') + '</div>');
+                    // Build UPS display with model on left, details on right
+                    let upsHtml = '<tr>';
+                    upsHtml += '<td style="padding: 2px 10px 2px 0; text-align: left; width: 30%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word;">' + (upsModel || upsKey) + '</td>';
+                    upsHtml += '<td style="padding: 2px 0 2px 10px; text-align: right; width: 70%; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; white-space: normal;">' + statusLine + '</td>';
+                    upsHtml += '</tr>';
+                    
+                    allDisplayItems.push(upsHtml);
                 });
 
                 // Format the final output for all UPS devices
-                return '<div style="text-align: right;">' + allDisplayItems.join('') + '</div>';
+                return '<div style="padding-left: 20px; box-sizing: border-box;"><table style="width: 100%; border-collapse: collapse; table-layout: fixed;">' + allDisplayItems.join('') + '</table></div>';
             }
-		},        
+		},
         {
             xtype: 'box',
             colspan: 2,
-            padding: '0 0 10 0',
-        },        
+            padding: '15 0 5 0',
+            html: '<div style="font-size: 13px; font-weight: bold; margin: 10px 0 5px 0; padding: 5px 0; border-bottom: 1px solid #eee; color: #666;">System</div>',
+        },
         {
             colspan: 2,
             title: gettext('Kernel Version'),
@@ -49644,7 +49753,7 @@ Ext.define('PVE.node.StatusView', {
             colspan: 2,
             printBar: false,
             title: gettext('Sensor Mod Version'),
-            textField: 'pveversion',
+            textField: 'pveModVersion',
             value: '',
         },        
     ],
