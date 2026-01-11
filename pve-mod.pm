@@ -61,6 +61,8 @@ my $nvidia_gpu_enabled = 1; # Set to 1 to enable NVIDIA GPU support (not yet imp
 my $nvidia_debug_mode = 1; # Set to 1 to enable NVIDIA debug mode (load from files instead of nvidia-smi)
 my $nvidia_debug_devices = '/tmp/nvidia-smi-devices.csv';
 my $nvidia_debug_output = '/tmp/nvidia-smi-output.csv';
+my $sensors_debug_mode = 0; # Set to 1 to enable sensors debug mode (load from file instead of sensors command)
+my $sensors_debug_output = '/tmp/sensors-output.json';
 my $ups_enabled = 1; # Set to 1 to enable UPS support
 my $pve_mod_worker_pid;
 my $pve_mod_worker_running = 0;
@@ -644,7 +646,23 @@ sub _get_temperature_sensors {
     my $sensorsOutput;
 
     # Collect sensor data from lm-sensors
-    $sensorsOutput = `sensors -j 2>/dev/null | python3 -m json.tool`;
+    if ($sensors_debug_mode && -f $sensors_debug_output) {
+        # Debug mode: read from file
+        _debug(__LINE__, "Debug mode: reading sensors data from $sensors_debug_output");
+        if (open my $fh, '<', $sensors_debug_output) {
+            local $/;
+            $sensorsOutput = <$fh>;
+            close $fh;
+            _debug(__LINE__, "Read sensors data from debug file, length: " . length($sensorsOutput) . " bytes");
+        } else {
+            _debug(__LINE__, "Failed to open debug file $sensors_debug_output: $!");
+            $sensorsOutput = '{}';
+        }
+    } else {
+        # Production mode: call sensors command
+        $sensorsOutput = `sensors -j 2>/dev/null | python3 -m json.tool`;
+        _debug(__LINE__, "Raw sensors output collected from command");
+    }
     
     _debug(__LINE__, "Raw sensors output collected");
 
