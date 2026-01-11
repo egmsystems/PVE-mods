@@ -49105,7 +49105,9 @@ Ext.define('PVE.node.StatusView', {
             printBar: false,
             title: gettext('KSM sharing'),
             textField: 'ksm',
-            renderer: (record) => Proxmox.Utils.render_size(record.shared),
+            renderer: function (record) {
+                return Proxmox.Utils.render_size(record.shared);
+            },
             padding: '0 10 10 10',
         },
         {
@@ -49128,53 +49130,99 @@ Ext.define('PVE.node.StatusView', {
             printBar: false,
             textField: 'gpuStats',
             renderer: function(gpuStats) {
-                console.log(gpuStats);
                 if (!gpuStats || !gpuStats.Graphics || !gpuStats.Graphics.Intel) {
                     return 'N/A';
                 }
 
                 let html = '';
                 
-                Object.keys(gpuStats.Graphics.Intel).forEach(key => {
-                    const gpuData = gpuStats.Graphics.Intel[key];
-                    console.log("here1");
-                    html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
-                    html += `<div style="text-align: left; flex: 1;">${gpuData.name}</div>`;
-                    html += `<div style="text-align: right; flex: 1;">`;
-                    
-                    if (gpuData.stats.engines) {
-                        console.log("here2");
-                        // Render/3D
-                        if (gpuData.stats.engines['Render/3D']) {
-                            html += `Render/3D: ${gpuData.stats.engines['Render/3D'].busy}% | `;
-                        }
-                        
-                        // Video
-                        if (gpuData.stats.engines['Video']) {
-                            html += `Video: ${gpuData.stats.engines['Video'].busy}% | `;
-                        }
-                        
-                        // Blitter
-                        if (gpuData.stats.engines['Blitter']) {
-                            html += `Blitter: ${gpuData.stats.engines['Blitter'].busy}% | `;
-                        }
-                        
-                        // VideoEnhance
-                        if (gpuData.stats.engines['VideoEnhance']) {
-                            html += `VideoEnhance: ${gpuData.stats.engines['VideoEnhance'].busy}% | `;
-                        }
-                    }
-                    
-                    // Power and Frequency info
-                    html += `Power: ${gpuData.stats.power?.GPU ?? 'N/A'} / ${gpuData.stats.power?.Package ?? 'N/A'} ${gpuData.stats.power?.unit || 'W'}`;
-                    html += ` | Freq: ${gpuData.stats.frequency?.actual ?? 'N/A'}/${gpuData.stats.frequency?.requested ?? 'N/A'} ${gpuData.frequency?.unit || 'MHz'}`;
-                    
-                    html += `</div></div>`;
-                });
+                console.log(gpuStats);
 
-                // todo add NVIDIA
+                // Intel GPUs
+                if (gpuStats.Graphics.Intel) {
+                    Object.keys(gpuStats.Graphics.Intel).sort().forEach(key => {
+                        const gpuData = gpuStats.Graphics.Intel[key];
+                        html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
+                        html += `<div style="text-align: left; flex: 1;">${gpuData.name}</div>`;
+                        html += `<div style="text-align: right; flex: 1;">`;
+                        
+                        if (gpuData.stats.engines) {
+                            // Render/3D
+                            if (gpuData.stats.engines['Render/3D']) {
+                                html += `Render/3D: ${gpuData.stats.engines['Render/3D'].busy}% | `;
+                            }
+                            
+                            // Video
+                            if (gpuData.stats.engines['Video']) {
+                                html += `Video: ${gpuData.stats.engines['Video'].busy}% | `;
+                            }
+                            
+                            // Blitter
+                            if (gpuData.stats.engines['Blitter']) {
+                                html += `Blitter: ${gpuData.stats.engines['Blitter'].busy}% | `;
+                            }
+                            
+                            // VideoEnhance
+                            if (gpuData.stats.engines['VideoEnhance']) {
+                                html += `VideoEnhance: ${gpuData.stats.engines['VideoEnhance'].busy}% | `;
+                            }
+                        }
+                        
+                        // Power and Frequency info
+                        html += `Power: ${gpuData.stats.power?.GPU ?? 'N/A'} / ${gpuData.stats.power?.Package ?? 'N/A'} ${gpuData.stats.power?.unit || 'W'}`;
+                        html += ` | Freq: ${gpuData.stats.frequency?.actual ?? 'N/A'}/${gpuData.stats.frequency?.requested ?? 'N/A'} ${gpuData.frequency?.unit || 'MHz'}`;
+                        
+                        html += `</div></div>`;
+                    });
+                }
 
-                // todo add NVIDIA
+                // NVIDIA GPUs
+                if (gpuStats.Graphics.NVIDIA) {
+                    Object.keys(gpuStats.Graphics.NVIDIA).sort().forEach(key => {
+                        const gpuData = gpuStats.Graphics.NVIDIA[key];
+                        const stats = gpuData.stats;
+                        
+                        html += `<div style="display: flex; justify-content: space-between; align-items: center; margin-left: 28px;">`;
+                        html += `<div style="text-align: left; flex: 1;">${stats.name}</div>`;
+                        html += `<div style="text-align: right; flex: 1;">`;
+                        
+                        // GPU Utilization
+                        if (stats.utilization) {
+                            html += `GPU: ${stats.utilization.gpu}${stats.utilization.unit} | `;
+                            html += `MEM: ${stats.utilization.memory}${stats.utilization.unit} | `;
+                        }
+                        
+                        // Memory Usage
+                        if (stats.memory) {
+                            html += `VRAM: ${stats.memory.used}/${stats.memory.total} ${stats.memory.unit} | `;
+                        }
+                        
+                        // Temperature
+                        if (stats.temperature) {
+                            let tempStyle = '';
+                            if (stats.temperature.gpu >= 80) {
+                                tempStyle = 'color: red; font-weight: bold;';
+                            } else if (stats.temperature.gpu >= 70) {
+                                tempStyle = 'color: #FFC300; font-weight: bold;';
+                            }
+                            html += `Temp: <span style="${tempStyle}">${stats.temperature.gpu}${stats.temperature.unit}</span> | `;
+                        }
+                        
+                        // Fan Speed
+                        if (stats.fan) {
+                            html += `Fan: ${stats.fan.speed}${stats.fan.unit} | `;
+                        }
+                        
+                        // Power
+                        if (stats.power) {
+                            html += `Power: ${stats.power.draw}/${stats.power.limit} ${stats.power.unit}`;
+                        }
+                        
+                        html += `</div></div>`;
+                    });
+                }
+
+                // todo add AMD
 
                 return html;
             },
@@ -49318,7 +49366,11 @@ Ext.define('PVE.node.StatusView', {
                     // Call the recursive function to find fan keys and values
                     findFanKeys(parentObj, fanKeys);
                     // Sort the fan keys
-                    fanKeys.sort();
+                    fanKeys.sort((a, b) => {
+                        if (a.key < b.key) return -1;
+                        if (a.key > b.key) return 1;
+                        return 0;
+                    });
                     // Process each fan key and value
                     fanKeys.forEach(({ key: fanKey, value: fanSpeed }) => {
                     try {
@@ -49332,6 +49384,216 @@ Ext.define('PVE.node.StatusView', {
                 return '<div style="text-align: left; margin-left: 28px;">' + (speeds.length > 0 ? speeds.join(' | ') : 'N/A') + '</div>';
             }
         },
+        {
+			xtype: 'box',
+			colspan: 2,
+			html: gettext('UPS'),
+		},
+		{
+			itemId: 'upsc',
+			colspan: 2,
+			printBar: false,
+			title: gettext('Device'),
+			iconCls: 'fa fa-fw fa-battery-three-quarters',
+			textField: 'upsStats',
+			renderer: function(value) {
+                let objValue = {};
+                try {
+                    // Parse the UPS data
+                    if (typeof value === 'string') {
+                        objValue = JSON.parse(value) || {};
+                    } else if (typeof value === 'object') {
+                        objValue = value || {};
+                    }
+                } catch(e) {
+                    objValue = {};
+                }
+                
+                // If objValue is null or empty, return N/A
+                if (!objValue || Object.keys(objValue).length === 0) {
+                    return '<div style="text-align: right;"><span>N/A</span></div>';
+                }
+
+                // Helper function to get status color
+                function getStatusColor(status) {
+                    if (!status) return '#999';
+                    const statusUpper = status.toUpperCase();
+                    if (statusUpper.includes('OL')) return null;
+                    if (statusUpper.includes('OB')) return '#d9534f';
+                    if (statusUpper.includes('LB')) return '#d9534f';
+                    return '#f0ad4e';
+                }
+
+                // Helper function to get load/charge color
+                function getPercentageColor(value, isLoad = false) {
+                    if (!value || isNaN(value)) return '#999';
+                    const num = parseFloat(value);
+                    if (isLoad) {
+                        if (num >= 80) return '#d9534f';
+                        if (num >= 60) return '#f0ad4e';
+                        return null;
+                    } else {
+                        if (num <= 20) return '#d9534f';
+                        if (num <= 50) return '#f0ad4e';
+                        return null;
+                    }
+                }
+
+                // Helper function to format runtime
+                function formatRuntime(seconds) {
+                    if (!seconds || isNaN(seconds)) return 'N/A';
+                    const mins = Math.floor(seconds / 60);
+                    const secs = seconds % 60;
+                    return `${mins}m ${secs}s`;
+                }
+
+                // Process each UPS in the data
+                let allDisplayItems = [];
+                
+                Object.keys(objValue).forEach(upsKey => {
+                    const upsData = objValue[upsKey];
+                    
+                    // Extract key UPS information
+                    const batteryCharge = upsData['battery.charge'];
+                    const batteryRuntime = upsData['battery.runtime'];
+                    const inputVoltage = upsData['input.voltage'];
+                    const upsLoad = upsData['ups.load'];
+                    const upsStatus = upsData['ups.status'];
+                    const upsModel = upsData['ups.model'] || upsData['device.model'];
+                    const testResult = upsData['ups.test.result'];
+                    const batteryChargeLow = upsData['battery.charge.low'];
+                    const batteryRuntimeLow = upsData['battery.runtime.low'];
+                    const upsRealPowerNominal = upsData['ups.realpower.nominal'];
+                    const batteryMfrDate = upsData['battery.mfr.date'];
+
+                    let displayItems = [];
+
+                    // First line: UPS identifier and model
+                    let modelLine = '';
+                    if (upsModel) {
+                        modelLine = `${upsModel}:`;
+                    } else {
+                        modelLine = `${upsKey}: N/A`;
+                    }
+                    displayItems.push(modelLine);
+
+                    // Main status line with all metrics
+                    let statusLine = '';
+
+                    // Status
+                    if (upsStatus) {
+                        const statusUpper = upsStatus.toUpperCase();
+                        let statusText = 'Unknown';
+                        let statusColor = '#f0ad4e';
+
+                        if (statusUpper.includes('OL')) {
+                            statusText = 'Online';
+                            statusColor = null;
+                        } else if (statusUpper.includes('OB')) {
+                            statusText = 'On Battery';
+                            statusColor = '#d9534f';
+                        } else if (statusUpper.includes('LB')) {
+                            statusText = 'Low Battery';
+                            statusColor = '#d9534f';
+                        } else {
+                            statusText = upsStatus;
+                            statusColor = '#f0ad4e';
+                        }
+
+                        let statusStyle = statusColor ? ('color: ' + statusColor + ';') : '';
+                        statusLine += 'Status: <span style="' + statusStyle + '">' + statusText + '</span>';
+                    } else {
+                        statusLine += 'Status: <span>N/A</span>';
+                    }
+
+                    // Battery charge
+                    if (statusLine) statusLine += ' | ';
+                    if (batteryCharge) {
+                        const chargeColor = getPercentageColor(batteryCharge, false);
+                        let chargeStyle = chargeColor ? ('color: ' + chargeColor + ';') : '';
+                        statusLine += 'Battery: <span style="' + chargeStyle + '">' + batteryCharge + '%</span>';
+                    } else {
+                        statusLine += 'Battery: <span>N/A</span>';
+                    }
+
+                    // Load percentage
+                    if (statusLine) statusLine += ' | ';
+                    if (upsLoad) {
+                        const loadColor = getPercentageColor(upsLoad, true);
+                        let loadStyle = loadColor ? ('color: ' + loadColor + ';') : '';
+                        statusLine += 'Load: <span style="' + loadStyle + '">' + upsLoad + '%</span>';
+                    } else {
+                        statusLine += 'Load: <span>N/A</span>';
+                    }
+
+                    // Runtime
+                    if (statusLine) statusLine += ' | ';
+                    if (batteryRuntime) {
+                        const runtime = parseInt(batteryRuntime);
+                        const runtimeLowThreshold = batteryRuntimeLow ? parseInt(batteryRuntimeLow) : 600;
+                        let runtimeColor = null;
+                        if (runtime <= runtimeLowThreshold / 2) runtimeColor = '#d9534f';
+                        else if (runtime <= runtimeLowThreshold) runtimeColor = '#f0ad4e';
+                        let runtimeStyle = runtimeColor ? ('color: ' + runtimeColor + ';') : '';
+                        statusLine += 'Runtime: <span style="' + runtimeStyle + '">' + formatRuntime(runtime) + '</span>';
+                    } else {
+                        statusLine += 'Runtime: <span>N/A</span>';
+                    }
+
+                    // Input voltage
+                    if (statusLine) statusLine += ' | ';
+                    if (inputVoltage) {
+                        statusLine += 'Input: <span>' + parseFloat(inputVoltage).toFixed(0) + 'V</span>';
+                    } else {
+                        statusLine += 'Input: <span>N/A</span>';
+                    }
+
+                    // Calculate actual watt usage
+                    if (statusLine) statusLine += ' | ';
+                    let actualWattage = null;
+                    if (upsLoad && upsRealPowerNominal) {
+                        const load = parseFloat(upsLoad);
+                        const nominal = parseFloat(upsRealPowerNominal);
+                        if (!isNaN(load) && !isNaN(nominal)) {
+                            actualWattage = Math.round((load / 100) * nominal);
+                        }
+                    }
+
+                    // Real power (calculated watt usage)
+                    if (actualWattage !== null) {
+                        statusLine += 'Output: <span>' + actualWattage + 'W</span>';
+                    } else {
+                        statusLine += 'Output: <span>N/A</span>';
+                    }
+
+                    displayItems.push(statusLine);
+
+                    // Combined battery and test line
+                    let batteryTestLine = '';
+                    if (batteryMfrDate) {
+                        batteryTestLine += '<span>Battery MFD: ' + batteryMfrDate + '</span>';
+                    } else {
+                        batteryTestLine += '<span>Battery MFD: N/A</span>';
+                    }
+
+                    if (testResult && !testResult.toLowerCase().includes('no test')) {
+                        const testColor = testResult.toLowerCase().includes('passed') ? null : '#d9534f';
+                        let testStyle = testColor ? ('color: ' + testColor + ';') : '';
+                        batteryTestLine += ' | <span style="' + testStyle + '">Test: ' + testResult + '</span>';
+                    } else {
+                        batteryTestLine += ' | <span>Test: N/A</span>';
+                    }
+
+                    displayItems.push(batteryTestLine);
+                    
+                    // Add this UPS's display to the overall collection
+                    allDisplayItems.push('<div style="margin-bottom: 10px;">' + displayItems.join('<br>') + '</div>');
+                });
+
+                // Format the final output for all UPS devices
+                return '<div style="text-align: right;">' + allDisplayItems.join('') + '</div>';
+            }
+		},        
         {
             xtype: 'box',
             colspan: 2,
@@ -49927,6 +50189,14 @@ Ext.define('PVE.node.Summary', {
                             store: rrdstore,
                             unit: 'percent',
                         },
+                        {
+                            // todo find me
+                            xtype: 'proxmoxRRDChart',
+                            title: gettext('Graphics Intel'),
+                            fields: ['netin', 'netout'],
+                            fieldTitles: [gettext('Incoming'), gettext('Outgoing')],
+                            store: rrdstore,
+                        },                        
                     ],
                     listeners: {
                         resize: function (panel) {
