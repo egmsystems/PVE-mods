@@ -156,7 +156,8 @@ sub _parse_intel_gpu_line {
 sub _get_intel_gpu_devices {
     my @devices = ();
     
-    return @devices unless -x '/usr/bin/intel_gpu_top';
+    # Check if intel_gpu_top is available (debug mode doesn't apply to device listing)
+    return @devices unless _check_executable('/usr/bin/intel_gpu_top', 'Intel GPU');
     
     _debug(__LINE__, "Getting Intel GPU devices");
     if (open my $fh, '-|', 'intel_gpu_top -L') {
@@ -318,6 +319,11 @@ sub get_nvidia_gpu_devices {
     # 0, NVIDIA GeForce RTX 3080
     # 1, NVIDIA RTX A4000
     
+    # Check if nvidia-smi is available (or debug mode with debug file)
+    unless (_check_executable('/usr/bin/nvidia-smi', 'NVIDIA', $nvidia_debug_mode, $nvidia_debug_devices)) {
+        return @devices;
+    }
+    
     if ($nvidia_debug_mode && -f $nvidia_debug_devices) {
         _debug(__LINE__, "Debug mode: reading NVIDIA GPU devices from $nvidia_debug_devices");
         if (open my $fh, '<', $nvidia_debug_devices) {
@@ -367,8 +373,6 @@ sub get_nvidia_gpu_devices {
                 }
             }
             close $fh;
-        } else {
-            _debug(__LINE__, "Failed to run nvidia-smi: $!");
         }
     }
     
@@ -450,7 +454,13 @@ sub _get_and_write_nvidia_stats {
             _debug(__LINE__, "Failed to open debug file $nvidia_debug_output: $!");
         }
     } else {
-        # Production mode: query all GPUs at once
+        # Production mode: check if nvidia-smi is available before querying
+        unless (_check_executable('/usr/bin/nvidia-smi', 'NVIDIA')) {
+            _debug(__LINE__, "nvidia-smi not available, cannot collect stats");
+            return 0;
+        }
+        
+        # Query all GPUs at once
         my $query = 'index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed';
         my $cmd = "nvidia-smi --query-gpu=$query --format=csv,nounits";
         
@@ -468,8 +478,6 @@ sub _get_and_write_nvidia_stats {
                 push @all_stats, $stats if $stats;
             }
             close $fh;
-        } else {
-            _debug(__LINE__, "Failed to run nvidia-smi: $!");
         }
     }
     
@@ -599,9 +607,9 @@ sub _collector_for_temperature_sensors {
 
     _debug(__LINE__, "Temperature sensor collector started");
 
-    # return if lm-sensors is not installed
-    unless (-x '/usr/bin/sensors') {
-        _debug(__LINE__, "sensors not available, exiting");
+    # Check if lm-sensors is available (or debug mode with debug file)
+    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $sensors_debug_mode, $sensors_debug_output)) {
+        _debug(__LINE__, "sensors not available and not in debug mode, exiting");
         exit(1);
     }
 
@@ -1289,14 +1297,32 @@ sub _ensure_pve_mod_directory_exists {
 }
 
 # Generic function to check if required executable exists
+# Returns 1 if executable exists or debug mode is enabled for that type
+# Returns 0 if executable doesn't exist and debug mode is not enabled
 sub _check_executable {
-    my ($exec_path, $type) = @_;
+    my ($exec_path, $type, $debug_mode_enabled, $debug_file) = @_;
     
+    # If debug mode is enabled for this type, check if debug file exists instead
+    if (defined $debug_mode_enabled && $debug_mode_enabled) {
+        if (defined $debug_file && -f $debug_file) {
+            _debug(__LINE__, "Debug mode enabled for $type, using debug file: $debug_file");
+            return 1;
+        } elsif (defined $debug_file) {
+            _debug(__LINE__, "Debug mode enabled for $type but debug file missing: $debug_file");
+            return 0;
+        } else {
+            _debug(__LINE__, "Debug mode enabled for $type, skipping executable check for $exec_path");
+            return 1;
+        }
+    }
+    
+    # Normal mode: check if executable exists
     unless (-x $exec_path) {
-        _debug(__LINE__, "$exec_path not executable for $type");
+        _debug(__LINE__, "$type executable not found or not executable: $exec_path");
         return 0;
     }
-    _debug(__LINE__, "$exec_path is executable");
+    
+    _debug(__LINE__, "$type executable found: $exec_path");
     return 1;
 }
 
@@ -1581,8 +1607,6 @@ sub _start_graphics_collectors {
     if ($nvidia_gpu_enabled) {
         _debug(__LINE__, "NVIDIA GPU support enabled");
 
-        # return unless _check_executable('/usr/bin/nvidia-smi', 'NVIDIA');
-
         my @nvidia_devices = get_nvidia_gpu_devices();
         _debug(__LINE__, "Got " . scalar(@nvidia_devices) . " NVIDIA devices");
         
@@ -1608,9 +1632,9 @@ sub _start_graphics_collectors {
 sub _start_sensors_collector {
     _debug(__LINE__, "Starting temperature sensor collector");
     
-    # Check if sensors is available
-    unless (-x '/usr/bin/sensors') {
-        _debug(__LINE__, "sensors not available, skipping");
+    # Check if sensors is available (or debug mode with debug file)
+    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $sensors_debug_mode, $sensors_debug_output)) {
+        _debug(__LINE__, "sensors not available and not in debug mode, skipping");
         return;
     }
     
@@ -1628,7 +1652,7 @@ sub _start_ups_collector {
     _debug(__LINE__, "Starting UPS collector");
     
     # Check if upsc is available
-    unless (-x '/usr/bin/upsc') {
+    unless (_check_executable('/usr/bin/upsc', 'UPS')) {
         _debug(__LINE__, "upsc not available, skipping UPS collector startup");
         return;
     }
