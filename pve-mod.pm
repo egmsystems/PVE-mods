@@ -995,26 +995,6 @@ sub _get_cpu_name {
     return $enhanced_json;
 }
 
-sub read_sysfs {
-    my ($path) = @_;
-    
-    return "unknown" unless defined $path && -f $path;
-    
-    if (open my $fh, '<', $path) {
-        my $value = <$fh>;
-        close $fh;
-        
-        if (defined $value) {
-            chomp $value;
-            # Remove leading/trailing whitespace
-            $value =~ s/^\s+|\s+$//g;
-            return $value ne '' ? $value : "unknown";
-        }
-    }
-    
-    return "unknown";
-}
-
 # Helper function to get CPU model by package ID
 sub _cpu_model_by_package {
     my ($pkg) = @_;
@@ -1175,6 +1155,26 @@ sub _parse_upsc_output {
 # ============================================================================
 # Supporting functions
 # ============================================================================
+
+sub read_sysfs {
+    my ($path) = @_;
+    
+    return "unknown" unless defined $path && -f $path;
+    
+    if (open my $fh, '<', $path) {
+        my $value = <$fh>;
+        close $fh;
+        
+        if (defined $value) {
+            chomp $value;
+            # Remove leading/trailing whitespace
+            $value =~ s/^\s+|\s+$//g;
+            return $value ne '' ? $value : "unknown";
+        }
+    }
+    
+    return "unknown";
+}
 
 sub _is_process_alive {
     my ($pid) = @_;
@@ -1448,6 +1448,10 @@ sub get_ups_stats {
     _notify_pve_mod_worker();
 
     return $ups_data;
+}
+
+sub get_pve_mod_version {
+    return $VERSION;
 }
 
 # ============================================================================
