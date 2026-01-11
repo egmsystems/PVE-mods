@@ -271,8 +271,9 @@ sub _collector_for_intel_device {
 sub _parse_graphic_info {
     my ($line) = @_;
 
-    # Create an intel file with 
-    # Timestamp Device index, name, Render/3D, Blitter, Video, VideoEnhance, power consumption
+    # Create a RRD Database (One-Time Setup)
+
+    # Collect intel GPU data and save it into the database
 
     return undef;
 }
@@ -304,7 +305,7 @@ sub _collector_for_amd_device {
 }
 
 # ============================================================================
-# NVIDIA GPU Support (Placeholder)
+# NVIDIA GPU Support
 # ============================================================================
 
 sub get_nvidia_gpu_devices {
@@ -314,8 +315,6 @@ sub get_nvidia_gpu_devices {
     # index, name
     # 0, NVIDIA GeForce RTX 3080
     # 1, NVIDIA RTX A4000
-
-    
     
     if ($nvidia_debug_mode && -f $nvidia_debug_devices) {
         _debug(__LINE__, "Debug mode: reading NVIDIA GPU devices from $nvidia_debug_devices");
@@ -424,6 +423,105 @@ sub parse_nvidia_gpu_line {
     return $stats;
 }
 
+sub _get_and_write_nvidia_stats {
+    my ($devices) = @_;
+    my @all_stats;
+    
+    if ($nvidia_debug_mode && -f $nvidia_debug_output) {
+        # Debug mode: read all GPUs from single file
+        _debug(__LINE__, "Debug mode: reading NVIDIA GPU stats from $nvidia_debug_output");
+        if (open my $fh, '<', $nvidia_debug_output) {
+            my $line_num = 0;
+            while (<$fh>) {
+                chomp;
+                $line_num++;
+                
+                # Skip header and empty lines
+                next if $line_num == 1 || /^\s*$/;
+                
+                # Parse the stats line
+                my $stats = parse_nvidia_gpu_line($_);
+                push @all_stats, $stats if $stats;
+            }
+            close $fh;
+        } else {
+            _debug(__LINE__, "Failed to open debug file $nvidia_debug_output: $!");
+        }
+    } else {
+        # Production mode: query all GPUs at once
+        my $query = 'index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed';
+        my $cmd = "nvidia-smi --query-gpu=$query --format=csv,nounits";
+        
+        if (open my $fh, '-|', $cmd) {
+            my $line_num = 0;
+            while (<$fh>) {
+                chomp;
+                $line_num++;
+                
+                # Skip header and empty lines
+                next if $line_num == 1 || /^\s*$/;
+                
+                # Parse the stats line
+                my $stats = parse_nvidia_gpu_line($_);
+                push @all_stats, $stats if $stats;
+            }
+            close $fh;
+        } else {
+            _debug(__LINE__, "Failed to run nvidia-smi: $!");
+        }
+    }
+    
+    # Write each GPU's stats to its own file
+    foreach my $stats (@all_stats) {
+        my $device_index = $stats->{index};
+        
+        # Untaint device_index for file operations (validate it's a number)
+        unless ($device_index =~ /^(\d+)$/) {
+            _debug(__LINE__, "Invalid device index: $device_index, skipping");
+            next;
+        }
+        $device_index = $1;  # Now untainted
+        
+        my $node_name = "gpu$device_index";
+        my $device_state_file = "$pve_mod_working_dir/stats-nvidia$device_index.json";
+        
+        # Find device name from devices array
+        my $device_name = $stats->{name};  # Fallback to name from stats
+        foreach my $dev (@$devices) {
+            if ($dev->{index} == $device_index) {
+                $device_name = $dev->{name};
+                last;
+            }
+        }
+        
+        # Build device-specific structure
+        my $device_data = {
+            $node_name => {
+                name => $device_name,
+                index => $device_index,
+                stats => $stats
+            }
+        };
+        
+        # Write to device-specific file
+        eval {
+            open my $ofh, '>', $device_state_file or die "Failed to open $device_state_file: $!";
+            print $ofh JSON->new->pretty->encode($device_data);
+            close $ofh;
+            _debug(__LINE__, "Wrote NVIDIA GPU $device_index stats to $device_state_file");
+        };
+        if ($@) {
+            _debug(__LINE__, "Error writing NVIDIA stats for GPU $device_index: $@");
+        }
+    }
+    
+    unless (@all_stats) {
+        _debug(__LINE__, "No valid NVIDIA GPU stats collected");
+    }
+    
+    return scalar(@all_stats);
+}
+
 sub _collector_for_nvidia_devices {
     my ($devices) = @_;
     $process_type = 'collector';
@@ -449,99 +547,8 @@ sub _collector_for_nvidia_devices {
     # 1, NVIDIA RTX A4000, 58, 45, 32, 4120, 16384, 145.50, 200.00, 55
     
     while (!$shutdown) {
-        my @all_stats;
-        
-        if ($nvidia_debug_mode && -f $nvidia_debug_output) {
-            # Debug mode: read all GPUs from single file
-            _debug(__LINE__, "Debug mode: reading NVIDIA GPU stats from $nvidia_debug_output");
-            if (open my $fh, '<', $nvidia_debug_output) {
-                my $line_num = 0;
-                while (<$fh>) {
-                    chomp;
-                    $line_num++;
-                    
-                    # Skip header and empty lines
-                    next if $line_num == 1 || /^\s*$/;
-                    
-                    # Parse the stats line
-                    my $stats = parse_nvidia_gpu_line($_);
-                    push @all_stats, $stats if $stats;
-                }
-                close $fh;
-            } else {
-                _debug(__LINE__, "Failed to open debug file $nvidia_debug_output: $!");
-            }
-        } else {
-            # Production mode: query all GPUs at once
-            my $query = 'index,name,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,power.limit,fan.speed';
-            my $cmd = "nvidia-smi --query-gpu=$query --format=csv,nounits";
-            
-            if (open my $fh, '-|', $cmd) {
-                my $line_num = 0;
-                while (<$fh>) {
-                    chomp;
-                    $line_num++;
-                    
-                    # Skip header and empty lines
-                    next if $line_num == 1 || /^\s*$/;
-                    
-                    # Parse the stats line
-                    my $stats = parse_nvidia_gpu_line($_);
-                    push @all_stats, $stats if $stats;
-                }
-                close $fh;
-            } else {
-                _debug(__LINE__, "Failed to run nvidia-smi: $!");
-            }
-        }
-        
-        # Write each GPU's stats to its own file
-        foreach my $stats (@all_stats) {
-            my $device_index = $stats->{index};
-            
-            # Untaint device_index for file operations (validate it's a number)
-            unless ($device_index =~ /^(\d+)$/) {
-                _debug(__LINE__, "Invalid device index: $device_index, skipping");
-                next;
-            }
-            $device_index = $1;  # Now untainted
-            
-            my $node_name = "gpu$device_index";
-            my $device_state_file = "$pve_mod_working_dir/stats-nvidia$device_index.json";
-            
-            # Find device name from devices array
-            my $device_name = $stats->{name};  # Fallback to name from stats
-            foreach my $dev (@$devices) {
-                if ($dev->{index} == $device_index) {
-                    $device_name = $dev->{name};
-                    last;
-                }
-            }
-            
-            # Build device-specific structure
-            my $device_data = {
-                $node_name => {
-                    name => $device_name,
-                    index => $device_index,
-                    stats => $stats
-                }
-            };
-            
-            # Write to device-specific file
-            eval {
-                open my $ofh, '>', $device_state_file or die "Failed to open $device_state_file: $!";
-                print $ofh JSON->new->pretty->encode($device_data);
-                close $ofh;
-                _debug(__LINE__, "Wrote NVIDIA GPU $device_index stats to $device_state_file");
-            };
-            if ($@) {
-                _debug(__LINE__, "Error writing NVIDIA stats for GPU $device_index: $@");
-            }
-        }
-        
-        unless (@all_stats) {
-            _debug(__LINE__, "No valid NVIDIA GPU stats collected");
-        }
+        # Collect and write NVIDIA GPU stats
+        _get_and_write_nvidia_stats($devices);
         
         sleep $data_pull_interval unless $shutdown;
     }
@@ -578,8 +585,6 @@ sub _start_child_collector {
     _debug(__LINE__, "Forked child PID $pid for $collector_name");
     return $pid;
 }
-
-# Legacy PID file functions removed - worker now manages collectors directly via %collectors hash
 
 # ============================================================================
 # Temperature Sensors
