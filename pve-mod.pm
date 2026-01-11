@@ -4,7 +4,6 @@ use strict;
 use warnings;
 use JSON;
 use POSIX qw(WNOHANG);
-use Fcntl qw(:flock);
 use Time::HiRes qw(time);
 use Fcntl qw(:flock O_CREAT O_EXCL O_WRONLY);
 use File::Path qw(remove_tree);
@@ -12,6 +11,63 @@ use File::Path qw(remove_tree);
 # debug configuration - set to 0 to disable all _debug output
 my $debug_ENABLED = 1;
 my $VERSION = '1.0.0';
+
+# ============================================================================
+# Configuration
+# ============================================================================
+my %config = (
+    gpu => {
+        intel_enabled => 1,
+        amd_enabled => 0,
+        nvidia_enabled => 1,
+    },
+    debug => {
+        nvidia_mode => 1,
+        nvidia_devices_file => '/tmp/nvidia-smi-devices.csv',
+        nvidia_output_file => '/tmp/nvidia-smi-output.csv',
+        sensors_mode => 0,
+        sensors_output_file => '/tmp/sensors-output.json',
+    },
+    intervals => {
+        data_pull => 1,          # seconds between data pulls
+        collector_timeout => 10, # stop collectors after N seconds of inactivity
+    },
+    ups => {
+        enabled => 1,
+        device_name => 'ups@192.168.3.2',
+    },
+    paths => {
+        working_dir => '/run/pveproxy/pve-mod',
+    },
+);
+
+# ============================================================================
+# Derived paths and runtime state
+# ============================================================================
+
+# Derived paths from configuration
+my $pve_mod_working_dir = $config{paths}{working_dir};
+my $stats_dir = $pve_mod_working_dir;
+my $state_file = "$pve_mod_working_dir/stats.json";
+my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
+my $ups_state_file = "$pve_mod_working_dir/ups.json";
+my $pve_mod_worker_lock = "$pve_mod_working_dir/pve_mod_worker.lock";
+my $startup_lock = "$pve_mod_working_dir/startup.lock";
+
+# Runtime state variables
+my $process_type = 'main';  # 'main', 'worker', or 'collector'
+my $last_snapshot = {};
+my $last_mtime = 0;
+my $last_get_graphic_stats_time = 0;
+my $pve_mod_worker_pid;
+my $pve_mod_worker_running = 0;
+
+# Collector registry - only populated in worker process
+my %collectors = ();  # key: device/card name, value: PID
+
+# ============================================================================
+# Shared Utility Functions
+# ============================================================================
 
 # debug function showing line number and call chain
 # Usage: _debug(__LINE__, "message")
@@ -38,44 +94,266 @@ sub _debug {
     }
 }
 
-my $pve_mod_working_dir = '/run/pveproxy/pve-mod';
-my $stats_dir = $pve_mod_working_dir;
-my $state_file = "$pve_mod_working_dir/stats.json";
-my $sensors_state_file = "$pve_mod_working_dir/sensors.json";
-my $ups_state_file = "$pve_mod_working_dir/ups.json";
+sub read_sysfs {
+    my ($path) = @_;
+    
+    return "unknown" unless defined $path && -f $path;
+    
+    if (open my $fh, '<', $path) {
+        my $value = <$fh>;
+        close $fh;
+        
+        if (defined $value) {
+            chomp $value;
+            # Remove leading/trailing whitespace
+            $value =~ s/^\s+|\s+$//g;
+            return $value ne '' ? $value : "unknown";
+        }
+    }
+    
+    return "unknown";
+}
 
-my $pve_mod_worker_lock = "$pve_mod_working_dir/pve_mod_worker.lock"; # PVE Mod worker lock 
-my $startup_lock = "$pve_mod_working_dir/startup.lock";  # Exclusive startup lock
-my $last_snapshot = {};
-my $last_mtime = 0;
+sub _is_process_alive {
+    my ($pid) = @_;
+    return -d "/proc/$pid";
+}
 
-# Collector registry - only populated in worker process
-my %collectors = ();  # key: device/card name, value: PID
-my $last_get_graphic_stats_time = 0;  # Track when get_graphic_stats was last called
-my $COLLECTOR_TIMEOUT = 10;   # Stop collectors x seconds after last get_graphic_stats call
-my $data_pull_interval = 1; # Interval in seconds between data pulls
+sub _read_lock_pid {
+    my ($lock_path) = @_;
+    
+    return undef unless open(my $fh, '<', $lock_path);
+    
+    my $pid = <$fh>;
+    close($fh);
+    chomp $pid if defined $pid;
+    
+    return $pid;
+}
 
-my $intel_gpu_enabled = 1; # Set to 0 to disable Intel GPU support
-my $amd_gpu_enabled   = 0; # Set to 1 to enable AMD GPU support (not yet implemented)
-my $nvidia_gpu_enabled = 1; # Set to 1 to enable NVIDIA GPU support (not yet implemented)
-my $nvidia_debug_mode = 1; # Set to 1 to enable NVIDIA debug mode (load from files instead of nvidia-smi)
-my $nvidia_debug_devices = '/tmp/nvidia-smi-devices.csv';
-my $nvidia_debug_output = '/tmp/nvidia-smi-output.csv';
-my $sensors_debug_mode = 0; # Set to 1 to enable sensors debug mode (load from file instead of sensors command)
-my $sensors_debug_output = '/tmp/sensors-output.json';
-my $ups_enabled = 1; # Set to 1 to enable UPS support
-my $pve_mod_worker_pid;
-my $pve_mod_worker_running = 0;
+sub _acquire_exclusive_lock {
+    my ($lock_path, $purpose) = @_;
+    $purpose //= 'lock';
+    
+    my $fh;
 
-# UPS Configuration
-my $ups_device = {
-    ups_name => 'ups@192.168.3.2',  # Format: upsname[@hostname[:port]]
-};
+    # Try to create lock file exclusively
+    if (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
+        _debug(__LINE__, "Acquired $purpose on first try");
+        return $fh;
+    }
+    
+    # Lock file creation failed - check if it's stale or held by another process
+    _debug(__LINE__, ucfirst($purpose) . " exists, checking if stale");
+    
+    my $lock_pid = _read_lock_pid($lock_path);
+    
+    if (!defined $lock_pid) {
+        _debug(__LINE__, "Could not read $purpose file: $!");
+        return undef;
+    }
+    
+    if ($lock_pid eq '' || $lock_pid !~ /^\d+$/) {
+        _debug(__LINE__, "Invalid PID in $purpose: '" . ($lock_pid // 'undefined') . "', removing");
+        unlink($lock_path);
+    } elsif (_is_process_alive($lock_pid)) {
+        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is still alive");
+        return undef;
+    } else {
+        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is dead, removing stale lock");
+        unlink($lock_path);
+    }
+    
+    # Try to acquire lock again after cleanup
+    unless (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
+        _debug(__LINE__, "Failed to acquire $purpose on retry: $!");
+        return undef;
+    }
+    
+    _debug(__LINE__, "Acquired $purpose after removing stale lock");
+    return $fh;
+}
 
-# ============================================================================
-# Code starts here
-# ============================================================================
-my $process_type = 'main';  # 'main', 'worker', or 'collector'
+sub _is_lock_stale {
+    my ($lock_path) = @_;
+    
+    return 0 unless open(my $fh, '<', $lock_path);
+    
+    my $lock_pid = <$fh>;
+    chomp $lock_pid if defined $lock_pid;
+    close($fh);
+    
+    # Invalid or missing PID
+    return 1 unless defined $lock_pid && $lock_pid =~ /^\d+$/;
+    
+    # Valid PID but process is dead
+    return !_is_process_alive($lock_pid);
+}
+
+sub _ensure_pve_mod_directory_exists {
+    unless (-d $pve_mod_working_dir) {
+        _debug(__LINE__, "Creating directory $pve_mod_working_dir");
+        unless (mkdir($pve_mod_working_dir, 0755)) {
+            _debug(__LINE__, "Failed to create $pve_mod_working_dir: $!. PVE Mod cannot start.");
+            die "Failed to create $pve_mod_working_dir: $!";
+        }
+        _debug(__LINE__, "Directory $pve_mod_working_dir created");
+    } else {
+        _debug(__LINE__, "Directory $pve_mod_working_dir already exists");
+    }
+}
+
+# Generic function to check if required executable exists
+# Returns 1 if executable exists or debug mode is enabled for that type
+# Returns 0 if executable doesn't exist and debug mode is not enabled
+sub _check_executable {
+    my ($exec_path, $type, $debug_mode_enabled, $debug_file) = @_;
+    
+    # If debug mode is enabled for this type, check if debug file exists instead
+    if (defined $debug_mode_enabled && $debug_mode_enabled) {
+        if (defined $debug_file && -f $debug_file) {
+            _debug(__LINE__, "Debug mode enabled for $type, using debug file: $debug_file");
+            return 1;
+        } elsif (defined $debug_file) {
+            _debug(__LINE__, "Debug mode enabled for $type but debug file missing: $debug_file");
+            return 0;
+        } else {
+            _debug(__LINE__, "Debug mode enabled for $type, skipping executable check for $exec_path");
+            return 1;
+        }
+    }
+    
+    # Normal mode: check if executable exists
+    unless (-x $exec_path) {
+        _debug(__LINE__, "$type executable not found or not executable: $exec_path");
+        return 0;
+    }
+    
+    _debug(__LINE__, "$type executable found: $exec_path");
+    return 1;
+}
+
+sub _pve_mod_hello {
+    _debug(__LINE__, "PVE Mod is being started. Version $VERSION");
+}
+
+# Setup common signal handlers for collector processes
+sub _setup_collector_signals {
+    my ($name, $shutdown_ref, $extra_cleanup) = @_;
+    
+    $SIG{TERM} = sub {
+        _debug(__LINE__, "Collector $name received SIGTERM");
+        $$shutdown_ref = 1;
+        $extra_cleanup->() if $extra_cleanup;
+    };
+    $SIG{INT} = sub {
+        _debug(__LINE__, "Collector $name received SIGINT");
+        $$shutdown_ref = 1;
+        $extra_cleanup->() if $extra_cleanup;
+    };
+}
+
+# Safe JSON file write with error handling
+sub _safe_write_json {
+    my ($filepath, $data, $pretty) = @_;
+    $pretty //= 1;
+    
+    eval {
+        open my $fh, '>', $filepath or die "Failed to open $filepath: $!";
+        my $json = $pretty ? JSON->new->pretty->encode($data) : encode_json($data);
+        print $fh $json;
+        close $fh;
+        _debug(__LINE__, "Wrote JSON to $filepath");
+    };
+    if ($@) {
+        _debug(__LINE__, "Error writing to $filepath: $@");
+        return 0;
+    }
+    return 1;
+}
+
+# Safe JSON file read with error handling
+sub _safe_read_json {
+    my ($filepath, $as_string) = @_;
+    
+    return unless -f $filepath;
+    
+    my $result;
+    eval {
+        open my $fh, '<', $filepath or die "Failed to open $filepath: $!";
+        local $/;
+        my $json = <$fh>;
+        close $fh;
+        
+        if ($as_string) {
+            $result = $json;
+        } else {
+            $result = decode_json($json);
+        }
+        _debug(__LINE__, "Read JSON from $filepath");
+    };
+    if ($@) {
+        _debug(__LINE__, "Error reading $filepath: $@");
+        return;
+    }
+    return $result;
+}
+
+# Parse CSV line with trimming
+sub _parse_csv_line {
+    my ($line, $expected_fields) = @_;
+    
+    return unless $line;
+    $line =~ s/^\s+|\s+$//g;
+    
+    my @values = map { s/^\s+|\s+$//gr } split(/,/, $line);
+    
+    return unless !$expected_fields || @values >= $expected_fields;
+    return @values;
+}
+
+# Enhance sensors data with cached lookups (unified for drives and CPUs)
+sub _enhance_sensors_with_cache {
+    my ($sensors_output, $cache_ref, $pattern, $lookup_sub, $field_names) = @_;
+    
+    $cache_ref //= {};
+    
+    my $sensors_data = _safe_read_json(\$sensors_output);
+    return $sensors_output unless $sensors_data;
+    
+    # For string input, parse it
+    unless (ref $sensors_data eq 'HASH') {
+        eval { $sensors_data = decode_json($sensors_output); };
+        return $sensors_output if $@;
+    }
+    
+    my @entries = grep { /$pattern/ } keys %{$sensors_data};
+    _debug(__LINE__, "Found " . scalar(@entries) . " entries matching pattern");
+    
+    foreach my $entry (@entries) {
+        my $metadata;
+        
+        # Check cache first
+        if (exists $cache_ref->{$entry}) {
+            $metadata = $cache_ref->{$entry};
+            _debug(__LINE__, "Using cached info for $entry");
+        } else {
+            # Lookup information
+            $metadata = $lookup_sub->($entry);
+            $cache_ref->{$entry} = $metadata if $metadata;
+        }
+        
+        # Add metadata to sensors data
+        if ($metadata && exists $sensors_data->{$entry}) {
+            foreach my $key (keys %$metadata) {
+                $sensors_data->{$entry}->{$key} = $metadata->{$key};
+            }
+            _debug(__LINE__, "Enhanced $entry with metadata");
+        }
+    }
+    
+    return JSON->new->pretty->canonical->encode($sensors_data);
+}
 
 # ============================================================================
 # Intel GPU Support
@@ -201,20 +479,13 @@ sub _collector_for_intel_device {
     
     # Set up signal handlers for graceful shutdown
     my $shutdown = 0;
-    $SIG{TERM} = sub {
-        _debug(__LINE__, "Collector for $device->{card} received SIGTERM");
-        $shutdown = 1;
+    _setup_collector_signals($device->{card}, \$shutdown, sub {
         kill 'TERM', $intel_gpu_top_pid if defined $intel_gpu_top_pid && $intel_gpu_top_pid > 0;
-    };
-    $SIG{INT} = sub {
-        _debug(__LINE__, "Collector for $device->{card} received SIGINT");
-        $shutdown = 1;
-        kill 'TERM', $intel_gpu_top_pid if defined $intel_gpu_top_pid && $intel_gpu_top_pid > 0;
-    };
+    });
     
     # Run intel_gpu_top once and keep reading from it
     _debug(__LINE__, "About to open pipe to intel_gpu_top");
-    my $intel_pull_interval = $data_pull_interval * 1000; # in milliseconds
+    my $intel_pull_interval = $config{intervals}{data_pull} * 1000; # in milliseconds
     $intel_gpu_top_pid = open(my $fh, '-|', "intel_gpu_top -d $drm_dev -s $intel_pull_interval -l 2>&1");
     
     unless (defined $intel_gpu_top_pid && $intel_gpu_top_pid > 0) {
@@ -252,15 +523,7 @@ sub _collector_for_intel_device {
                 };
                 
                 # Write to device-specific file
-                eval {
-                    open my $ofh, '>', $device_state_file or die "Failed to open $device_state_file: $!";
-                    print $ofh JSON->new->pretty->encode($device_data);
-                    close $ofh;
-                    _debug(__LINE__, "Wrote stats to $device_state_file (line #$line_count)");
-                };
-                if ($@) {
-                    _debug(__LINE__, "Error writing stats: $@");
-                }
+                _safe_write_json($device_state_file, $device_data);
             }
         }
     }
@@ -320,13 +583,13 @@ sub get_nvidia_gpu_devices {
     # 1, NVIDIA RTX A4000
     
     # Check if nvidia-smi is available (or debug mode with debug file)
-    unless (_check_executable('/usr/bin/nvidia-smi', 'NVIDIA', $nvidia_debug_mode, $nvidia_debug_devices)) {
+    unless (_check_executable('/usr/bin/nvidia-smi', 'NVIDIA', $config{debug}{nvidia_mode}, $config{debug}{nvidia_devices_file})) {
         return @devices;
     }
     
-    if ($nvidia_debug_mode && -f $nvidia_debug_devices) {
-        _debug(__LINE__, "Debug mode: reading NVIDIA GPU devices from $nvidia_debug_devices");
-        if (open my $fh, '<', $nvidia_debug_devices) {
+    if ($config{debug}{nvidia_mode} && -f $config{debug}{nvidia_devices_file}) {
+        _debug(__LINE__, "Debug mode: reading NVIDIA GPU devices from $config{debug}{nvidia_devices_file}");
+        if (open my $fh, '<', $config{debug}{nvidia_devices_file}) {
             my $line_num = 0;
             while (<$fh>) {
                 chomp;
@@ -335,20 +598,19 @@ sub get_nvidia_gpu_devices {
                 # Skip header line and empty lines
                 next if $line_num == 1 || /^\s*$/;
                 
-                # Parse CSV: "0, NVIDIA GeForce RTX 3080"
-                if (/^\s*(\d+)\s*,\s*(.+?)\s*$/) {
-                    my $index = $1;
-                    my $name = $2;
+                # Parse CSV using shared helper
+                my @values = _parse_csv_line($_, 2);
+                if (@values) {
                     push @devices, {
-                        name => $name,
-                        index => $index,
+                        index => $values[0],
+                        name => $values[1],
                     };
-                    _debug(__LINE__, "Found NVIDIA GPU device (debug): $name -> (index: $index)");
+                    _debug(__LINE__, "Found NVIDIA GPU device (debug): $values[1] -> (index: $values[0])");
                 }
             }
             close $fh;
         } else {
-            _debug(__LINE__, "Failed to open debug file $nvidia_debug_devices: $!");
+            _debug(__LINE__, "Failed to open debug file $config{debug}{nvidia_devices_file}: $!");
         }
     } else {
         # Use nvidia-smi to get device list
@@ -361,15 +623,14 @@ sub get_nvidia_gpu_devices {
                 # Skip header line and empty lines
                 next if $line_num == 1 || /^\s*$/;
                 
-                # Parse CSV: "0, NVIDIA GeForce RTX 3080"
-                if (/^\s*(\d+)\s*,\s*(.+?)\s*$/) {
-                    my $index = $1;
-                    my $name = $2;
+                # Parse CSV using shared helper
+                my @values = _parse_csv_line($_, 2);
+                if (@values) {
                     push @devices, {
-                        name => $name,
-                        index => $index,
+                        index => $values[0],
+                        name => $values[1],
                     };
-                    _debug(__LINE__, "Found NVIDIA GPU device: $name -> (index: $index)");
+                    _debug(__LINE__, "Found NVIDIA GPU device: $values[1] -> (index: $values[0])");
                 }
             }
             close $fh;
@@ -386,17 +647,9 @@ sub parse_nvidia_gpu_line {
     # index, name, temperature.gpu, utilization.gpu, utilization.memory, memory.used, memory.total, power.draw, power.limit, fan.speed
     #0, NVIDIA GeForce RTX 3080, 62, 79, 44, 8260, 10240, 268.12, 320.00, 67
 
-    # Remove leading/trailing whitespace
-    $line =~ s/^\s+|\s+$//g;
-    
-    # Skip empty lines
-    return unless $line;
-    
-    # Split by comma and trim whitespace from each field
-    my @values = map { s/^\s+|\s+$//gr } split(/,/, $line);
-    
-    # Expected: index(0), name(1), temp(2), util_gpu(3), util_mem(4), mem_used(5), mem_total(6), power_draw(7), power_limit(8), fan_speed(9)
-    return unless @values >= 10;
+    # Parse CSV using shared helper
+    my @values = _parse_csv_line($line, 10);
+    return unless @values;
     
     my $stats = {
         index => $values[0] + 0,
@@ -433,10 +686,10 @@ sub _get_and_write_nvidia_stats {
     my ($devices) = @_;
     my @all_stats;
     
-    if ($nvidia_debug_mode && -f $nvidia_debug_output) {
+    if ($config{debug}{nvidia_mode} && -f $config{debug}{nvidia_output_file}) {
         # Debug mode: read all GPUs from single file
-        _debug(__LINE__, "Debug mode: reading NVIDIA GPU stats from $nvidia_debug_output");
-        if (open my $fh, '<', $nvidia_debug_output) {
+        _debug(__LINE__, "Debug mode: reading NVIDIA GPU stats from $config{debug}{nvidia_output_file}");
+        if (open my $fh, '<', $config{debug}{nvidia_output_file}) {
             my $line_num = 0;
             while (<$fh>) {
                 chomp;
@@ -451,7 +704,7 @@ sub _get_and_write_nvidia_stats {
             }
             close $fh;
         } else {
-            _debug(__LINE__, "Failed to open debug file $nvidia_debug_output: $!");
+            _debug(__LINE__, "Failed to open debug file $config{debug}{nvidia_output_file}: $!");
         }
     } else {
         # Production mode: check if nvidia-smi is available before querying
@@ -514,15 +767,7 @@ sub _get_and_write_nvidia_stats {
         };
         
         # Write to device-specific file
-        eval {
-            open my $ofh, '>', $device_state_file or die "Failed to open $device_state_file: $!";
-            print $ofh JSON->new->pretty->encode($device_data);
-            close $ofh;
-            _debug(__LINE__, "Wrote NVIDIA GPU $device_index stats to $device_state_file");
-        };
-        if ($@) {
-            _debug(__LINE__, "Error writing NVIDIA stats for GPU $device_index: $@");
-        }
+        _safe_write_json($device_state_file, $device_data);
     }
     
     unless (@all_stats) {
@@ -542,14 +787,7 @@ sub _collector_for_nvidia_devices {
     
     # Set up signal handlers for graceful shutdown
     my $shutdown = 0;
-    $SIG{TERM} = sub {
-        _debug(__LINE__, "NVIDIA collector received SIGTERM");
-        $shutdown = 1;
-    };
-    $SIG{INT} = sub {
-        _debug(__LINE__, "NVIDIA collector received SIGINT");
-        $shutdown = 1;
-    };
+    _setup_collector_signals('nvidia-all', \$shutdown);
     
     # Expected CSV format (with header):
     # index, name, temperature.gpu, utilization.gpu, utilization.memory, memory.used, memory.total, power.draw, power.limit, fan.speed
@@ -560,40 +798,11 @@ sub _collector_for_nvidia_devices {
         # Collect and write NVIDIA GPU stats
         _get_and_write_nvidia_stats($devices);
         
-        sleep $data_pull_interval unless $shutdown;
+        sleep $config{intervals}{data_pull} unless $shutdown;
     }
     
     _debug(__LINE__, "NVIDIA collector shutting down");
     exit 0;
-}
-
-# ============================================================================
-# Unified Child Process Management
-# ============================================================================
-
-sub _start_child_collector {
-    my ($collector_name, $collector_sub, $device) = @_;
-    
-    _debug(__LINE__, "Starting child collector: $collector_name");
-    
-    my $pid = fork();
-    unless (defined $pid) {
-        _debug(__LINE__, "fork failed for $collector_name: $!");
-        return undef;
-    }
-    
-    if ($pid == 0) {
-        # Child process
-        $process_type = 'collector';
-        _debug(__LINE__, "In child process for $collector_name");
-        $0 = "collector-$collector_name";
-        $collector_sub->($device);
-        exit(0);
-    }
-    
-    # Parent process (worker only)
-    _debug(__LINE__, "Forked child PID $pid for $collector_name");
-    return $pid;
 }
 
 # ============================================================================
@@ -608,7 +817,7 @@ sub _collector_for_temperature_sensors {
     _debug(__LINE__, "Temperature sensor collector started");
 
     # Check if lm-sensors is available (or debug mode with debug file)
-    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $sensors_debug_mode, $sensors_debug_output)) {
+    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $config{debug}{sensors_mode}, $config{debug}{sensors_output_file})) {
         _debug(__LINE__, "sensors not available and not in debug mode, exiting");
         exit(1);
     }
@@ -618,19 +827,12 @@ sub _collector_for_temperature_sensors {
 
     # Set up signal handlers for graceful shutdown
     my $shutdown = 0;
-    $SIG{TERM} = sub {
-        _debug(__LINE__, "Temperature sensor collector received SIGTERM");
-        $shutdown = 1;
-    };
-    $SIG{INT} = sub {
-        _debug(__LINE__, "Temperature sensor collector received SIGINT");
-        $shutdown = 1;
-    };
+    _setup_collector_signals('temperature-sensors', \$shutdown);
 
     while (!$shutdown) {
         my $sensorsData = _get_temperature_sensors(\%cache_ref);
 
-        # Write to sensors state file
+        # Write to sensors state file (as string, not parsed JSON)
         eval {
             open my $ofh, '>', $sensors_state_file or die "Failed to open $sensors_state_file: $!";
             print $ofh $sensorsData;
@@ -641,7 +843,7 @@ sub _collector_for_temperature_sensors {
             _debug(__LINE__, "Error writing temperature sensor data: $@");
         }
 
-        sleep $data_pull_interval unless $shutdown;
+        sleep $config{intervals}{data_pull} unless $shutdown;
     }
 
     _debug(__LINE__, "Temperature sensor collector shutting down");
@@ -654,16 +856,16 @@ sub _get_temperature_sensors {
     my $sensorsOutput;
 
     # Collect sensor data from lm-sensors
-    if ($sensors_debug_mode && -f $sensors_debug_output) {
+    if ($config{debug}{sensors_mode} && -f $config{debug}{sensors_output_file}) {
         # Debug mode: read from file
-        _debug(__LINE__, "Debug mode: reading sensors data from $sensors_debug_output");
-        if (open my $fh, '<', $sensors_debug_output) {
+        _debug(__LINE__, "Debug mode: reading sensors data from $config{debug}{sensors_output_file}");
+        if (open my $fh, '<', $config{debug}{sensors_output_file}) {
             local $/;
             $sensorsOutput = <$fh>;
             close $fh;
             _debug(__LINE__, "Read sensors data from debug file, length: " . length($sensorsOutput) . " bytes");
         } else {
-            _debug(__LINE__, "Failed to open debug file $sensors_debug_output: $!");
+            _debug(__LINE__, "Failed to open debug file $config{debug}{sensors_output_file}: $!");
             $sensorsOutput = '{}';
         }
     } else {
@@ -1077,18 +1279,12 @@ sub _collector_for_ups {
     
     # Set up signal handlers for graceful shutdown
     my $shutdown = 0;
-    $SIG{TERM} = sub {
-        _debug(__LINE__, "UPS collector received SIGTERM");
-        $shutdown = 1;
-    };
-    $SIG{INT} = sub {
-        _debug(__LINE__, "UPS collector received SIGINT");
-        $shutdown = 1;
-    };
+    _setup_collector_signals("ups-$device->{ups_name}", \$shutdown);
+    
     while (!$shutdown) {
         my $upsData = _get_ups_status($device->{ups_name});
 
-        # Write to ups state file
+        # Write to ups state file (as string, not parsed JSON)
         eval {
             open my $ofh, '>', $ups_state_file or die "Failed to open $ups_state_file: $!";
             print $ofh $upsData;
@@ -1099,7 +1295,7 @@ sub _collector_for_ups {
             _debug(__LINE__, "Error writing ups data: $@");
         }
 
-        sleep $data_pull_interval unless $shutdown;
+        sleep $config{intervals}{data_pull} unless $shutdown;
     }
     _debug(__LINE__, "UPS collector shutting down");
     exit 0;
@@ -1181,153 +1377,6 @@ sub _parse_upsc_output {
     _debug(__LINE__, "Completed parsing upsc output");
 
     return $ups_data;
-}
-
-# ============================================================================
-# Supporting functions
-# ============================================================================
-
-sub read_sysfs {
-    my ($path) = @_;
-    
-    return "unknown" unless defined $path && -f $path;
-    
-    if (open my $fh, '<', $path) {
-        my $value = <$fh>;
-        close $fh;
-        
-        if (defined $value) {
-            chomp $value;
-            # Remove leading/trailing whitespace
-            $value =~ s/^\s+|\s+$//g;
-            return $value ne '' ? $value : "unknown";
-        }
-    }
-    
-    return "unknown";
-}
-
-sub _is_process_alive {
-    my ($pid) = @_;
-    return -d "/proc/$pid";
-}
-
-sub _read_lock_pid {
-    my ($lock_path) = @_;
-    
-    return undef unless open(my $fh, '<', $lock_path);
-    
-    my $pid = <$fh>;
-    close($fh);
-    chomp $pid if defined $pid;
-    
-    return $pid;
-}
-
-sub _acquire_exclusive_lock {
-    my ($lock_path, $purpose) = @_;
-    $purpose //= 'lock';
-    
-    my $fh;
-
-    # Try to create lock file exclusively
-    if (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
-        _debug(__LINE__, "Acquired $purpose on first try");
-        return $fh;
-    }
-    
-    # Lock file creation failed - check if it's stale or held by another process
-    _debug(__LINE__, ucfirst($purpose) . " exists, checking if stale");
-    
-    my $lock_pid = _read_lock_pid($lock_path);
-    
-    if (!defined $lock_pid) {
-        _debug(__LINE__, "Could not read $purpose file: $!");
-        return undef;
-    }
-    
-    if ($lock_pid eq '' || $lock_pid !~ /^\d+$/) {
-        _debug(__LINE__, "Invalid PID in $purpose: '" . ($lock_pid // 'undefined') . "', removing");
-        unlink($lock_path);
-    } elsif (_is_process_alive($lock_pid)) {
-        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is still alive");
-        return undef;
-    } else {
-        _debug(__LINE__, ucfirst($purpose) . " holder PID $lock_pid is dead, removing stale lock");
-        unlink($lock_path);
-    }
-    
-    # Try to acquire lock again after cleanup
-    unless (sysopen($fh, $lock_path, O_CREAT|O_EXCL|O_WRONLY, 0644)) {
-        _debug(__LINE__, "Failed to acquire $purpose on retry: $!");
-        return undef;
-    }
-    
-    _debug(__LINE__, "Acquired $purpose after removing stale lock");
-    return $fh;
-}
-
-sub _is_lock_stale {
-    my ($lock_path) = @_;
-    
-    return 0 unless open(my $fh, '<', $lock_path);
-    
-    my $lock_pid = <$fh>;
-    chomp $lock_pid if defined $lock_pid;
-    close($fh);
-    
-    # Invalid or missing PID
-    return 1 unless defined $lock_pid && $lock_pid =~ /^\d+$/;
-    
-    # Valid PID but process is dead
-    return !_is_process_alive($lock_pid);
-}
-
-sub _ensure_pve_mod_directory_exists {
-    unless (-d $pve_mod_working_dir) {
-        _debug(__LINE__, "Creating directory $pve_mod_working_dir");
-        unless (mkdir($pve_mod_working_dir, 0755)) {
-            _debug(__LINE__, "Failed to create $pve_mod_working_dir: $!. PVE Mod cannot start.");
-            die "Failed to create $pve_mod_working_dir: $!";
-        }
-        _debug(__LINE__, "Directory $pve_mod_working_dir created");
-    } else {
-        _debug(__LINE__, "Directory $pve_mod_working_dir already exists");
-    }
-}
-
-# Generic function to check if required executable exists
-# Returns 1 if executable exists or debug mode is enabled for that type
-# Returns 0 if executable doesn't exist and debug mode is not enabled
-sub _check_executable {
-    my ($exec_path, $type, $debug_mode_enabled, $debug_file) = @_;
-    
-    # If debug mode is enabled for this type, check if debug file exists instead
-    if (defined $debug_mode_enabled && $debug_mode_enabled) {
-        if (defined $debug_file && -f $debug_file) {
-            _debug(__LINE__, "Debug mode enabled for $type, using debug file: $debug_file");
-            return 1;
-        } elsif (defined $debug_file) {
-            _debug(__LINE__, "Debug mode enabled for $type but debug file missing: $debug_file");
-            return 0;
-        } else {
-            _debug(__LINE__, "Debug mode enabled for $type, skipping executable check for $exec_path");
-            return 1;
-        }
-    }
-    
-    # Normal mode: check if executable exists
-    unless (-x $exec_path) {
-        _debug(__LINE__, "$type executable not found or not executable: $exec_path");
-        return 0;
-    }
-    
-    _debug(__LINE__, "$type executable found: $exec_path");
-    return 1;
-}
-
-sub _pve_mod_hello {
-    _debug(__LINE__, "PVE Mod is being started. Version $VERSION");
 }
 
 # ============================================================================
@@ -1550,7 +1599,7 @@ sub _start_collector {
 
 sub _start_graphics_collectors {
 
-    if ($intel_gpu_enabled == 0 && $amd_gpu_enabled == 0 && $nvidia_gpu_enabled == 0) {
+    if (!$config{gpu}{intel_enabled} && !$config{gpu}{amd_enabled} && !$config{gpu}{nvidia_enabled}) {
         _debug(__LINE__, "No GPU types enabled, skipping collector startup");
         return;
     }
@@ -1564,7 +1613,7 @@ sub _start_graphics_collectors {
     my @all_collector_subs;
 
     # Intel
-    if ($intel_gpu_enabled) {
+    if ($config{gpu}{intel_enabled}) {
         _debug(__LINE__, "Intel GPU support enabled");
         _debug(__LINE__, "Checking for intel_gpu_top");
         
@@ -1584,7 +1633,7 @@ sub _start_graphics_collectors {
     }
     
     # AMD (future)
-    if ($amd_gpu_enabled) {
+    if ($config{gpu}{amd_enabled}) {
         _debug(__LINE__, "AMD GPU support enabled");
 
         return unless _check_executable('/usr/bin/rocm-smi', 'AMD');
@@ -1604,7 +1653,7 @@ sub _start_graphics_collectors {
     my $started_count = 0;
     
     # NVIDIA - single collector for all devices
-    if ($nvidia_gpu_enabled) {
+    if ($config{gpu}{nvidia_enabled}) {
         _debug(__LINE__, "NVIDIA GPU support enabled");
 
         my @nvidia_devices = get_nvidia_gpu_devices();
@@ -1633,7 +1682,7 @@ sub _start_sensors_collector {
     _debug(__LINE__, "Starting temperature sensor collector");
     
     # Check if sensors is available (or debug mode with debug file)
-    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $sensors_debug_mode, $sensors_debug_output)) {
+    unless (_check_executable('/usr/bin/sensors', 'lm-sensors', $config{debug}{sensors_mode}, $config{debug}{sensors_output_file})) {
         _debug(__LINE__, "sensors not available and not in debug mode, skipping");
         return;
     }
@@ -1644,7 +1693,7 @@ sub _start_sensors_collector {
 
 sub _start_ups_collector {
 
-    if ($ups_enabled == 0) {
+    if (!$config{ups}{enabled}) {
         _debug(__LINE__, "UPS support not enabled, skipping collector startup");
         return;
     }
@@ -1658,18 +1707,43 @@ sub _start_ups_collector {
     }
     
     # Check if UPS is configured
-    unless (defined $ups_device && $ups_device->{ups_name}) {
+    unless ($config{ups}{device_name}) {
         _debug(__LINE__, "No UPS configured, skipping collector startup");
         return;
     }
     
     # Use unified collector startup
-    _start_collector('ups', 'ups', \&_collector_for_ups, $ups_device);
+    _start_collector('ups', 'ups', \&_collector_for_ups, { ups_name => $config{ups}{device_name} });
 }
 
 # ============================================================================
 # PVE Mod Worker
 # ============================================================================
+
+sub _start_child_collector {
+    my ($collector_name, $collector_sub, $device) = @_;
+    
+    _debug(__LINE__, "Starting child collector: $collector_name");
+    
+    my $pid = fork();
+    unless (defined $pid) {
+        _debug(__LINE__, "fork failed for $collector_name: $!");
+        return undef;
+    }
+    
+    if ($pid == 0) {
+        # Child process
+        $process_type = 'collector';
+        _debug(__LINE__, "In child process for $collector_name");
+        $0 = "collector-$collector_name";
+        $collector_sub->($device);
+        exit(0);
+    }
+    
+    # Parent process (worker only)
+    _debug(__LINE__, "Forked child PID $pid for $collector_name");
+    return $pid;
+}
 
 sub _pve_mod_starter {
     # Check if pve_mod_worker is already running - if so, entire system is already up
@@ -1817,13 +1891,13 @@ sub _pve_mod_keep_alive {
     
     $SIG{TERM} = sub {
         _debug(__LINE__, "pve_mod_worker received SIGTERM, shutting down");
-        _stop_collectors();
+        _stop_child_collectors();
         unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
     $SIG{INT} = sub {
         _debug(__LINE__, "pve_mod_worker received SIGINT, shutting down");
-        _stop_collectors();
+        _stop_child_collectors();
         unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
         exit(0);
     };
@@ -1835,18 +1909,18 @@ sub _pve_mod_keep_alive {
     _start_ups_collector();
     _debug(__LINE__, "All collectors started by worker");
     
-    _debug(__LINE__, "Entering pve_mod_worker loop, timeout=${COLLECTOR_TIMEOUT}s");
+    _debug(__LINE__, "Entering pve_mod_worker loop, timeout=$config{intervals}{collector_timeout}s");
     
     while (1) {
         _debug(__LINE__, "pve_mod_worker loop start: checking activity");
         
         my $idle_time = time() - $last_activity;
         
-        _debug(__LINE__, "pve_mod_worker loop: idle_time=${idle_time}s, timeout=${COLLECTOR_TIMEOUT}s");
+        _debug(__LINE__, "pve_mod_worker loop: idle_time=${idle_time}s, timeout=$config{intervals}{collector_timeout}s");
         
-        if ($idle_time > $COLLECTOR_TIMEOUT) {
+        if ($idle_time > $config{intervals}{collector_timeout}) {
             _debug(__LINE__, "Timeout reached, stopping collectors");
-            _stop_collectors();
+            _stop_child_collectors();
             _debug(__LINE__, "Collectors stopped, exiting pve_mod_worker");
             unlink($pve_mod_worker_lock) if -f $pve_mod_worker_lock;
             exit(0);
@@ -1862,11 +1936,7 @@ sub _is_pve_mod_worker_running {
     return -f $pve_mod_worker_lock;
 }
 
-# ============================================================================
-# Other
-# ============================================================================
-
-sub _stop_collectors {
+sub _stop_child_collectors {
     _debug(__LINE__, "Stopping all collectors");
     
     # Get PIDs from worker's collector registry
@@ -1926,7 +1996,7 @@ sub _stop_collectors {
 END { 
     if ($process_type eq 'worker') {
         _debug(__LINE__, "PVE Mod Worker END block: cleaning up");
-        _stop_collectors();
+        _stop_child_collectors();
     } elsif ($process_type eq 'collector') {
         _debug(__LINE__, "Collector ($0) END block: no cleanup needed");
         # Collectors just exit, no cleanup needed
