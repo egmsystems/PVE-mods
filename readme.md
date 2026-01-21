@@ -57,7 +57,7 @@ The modification includes two main steps:
 1. Create backups of the original files in the `backup` directory relative to the script location.
 2. Modify code.
 
-The script provides three options:
+The script provides teo options:
 | **Option**             | **Description**                                                             |
 |-------------------------|-----------------------------------------------------------------------------|
 | `install`              | Installs the modification by applying the necessary changes.                |
