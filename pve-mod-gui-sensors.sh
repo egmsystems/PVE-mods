@@ -173,14 +173,14 @@ function configure {
 		info "Detected CPU sensors ($cpuCount): $cpuList"
 		SENSORS_DETECTED=true
 		while true; do
-			local choice=$(ask "Display temperatures for all cores [C] or average per CPU [a] (some newer AMD variants support per die)? (C/a)")
+			local choice=$(ask "Display temperatures for all cores [c] or average per CPU [A] (some newer AMD variants support per die)? (c/A)")
 			case "$choice" in
-				[cC]|"")
+				[cC])
 					CPU_TEMP_TARGET="Core"
 					info "Temperatures will be displayed for all cores."
 					break
 					;;
-				[aA])
+				[aA]|"")
 					CPU_TEMP_TARGET="Package"
 					info "An average temperature will be displayed per CPU."
 					break
