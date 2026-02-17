@@ -40,11 +40,10 @@ Notes:
 Instructions be performed as 'root', as normal users do not have access to the files.
 
 ```
-apt-get install lm-sensors
+apt-get -y install lm-sensors
 # lm-sensors must be configured, run below to configure your sensors, apply temperature offsets. Refer to lm-sensors manual for more information.
 sensors-detect 
-wget https://raw.githubusercontent.com/Meliox/PVE-mods/refs/heads/main/pve-mod-gui-sensors.sh
-bash pve-mod-gui-sensors.sh install
+curl -fsSL https://raw.githubusercontent.com/egmsystems/PVE-mods/refs/heads/main/pve-mod-gui-sensors.sh | bash -s install
 # Then clear the browser cache to ensure all changes are visualized.
 ```
 Additionally, adjustments are available in the first part of the script, where paths can be edited, cpucore offset and display information.
